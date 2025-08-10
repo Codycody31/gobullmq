@@ -121,7 +121,7 @@ type NextJobData struct {
 }
 
 // NewWorker creates a new Worker instance
-func NewWorker(ctx context.Context, name string, opts WorkerOptions, connection redis.Cmdable, processor WorkerProcessFunc) (*Worker, error) {
+func NewWorker(ctx context.Context, name string, opts WorkerOptions, connection redis.Cmdable, processor WorkerProcessFunc, ClusterMode bool) (*Worker, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
 	// TODO: Have default opts, then merge in the provided opts and allow the provided opts to override the default opts
@@ -157,12 +157,34 @@ func NewWorker(ctx context.Context, name string, opts WorkerOptions, connection 
 	if w.opts.StalledInterval <= 0 {
 		return nil, errors.New("stalledInterval must be greater than 0")
 	}
+	var client redis.Cmdable // interface implemented by both *redis.Client and *redis.ClusterClient
+	var Client_ok bool
+	if ClusterMode {
+		clusterClient, ok := w.redisClient.(*redis.ClusterClient)
 
-	client, ok := w.redisClient.(*redis.Client)
-	if !ok {
+		Client_ok = ok
+
+		client = clusterClient
+	} else {
+		singleClient, ok := w.redisClient.(*redis.Client)
+		Client_ok = ok
+		client = singleClient
+	}
+
+	// Now use `client` for Redis calls, regardless of Cluster or single node.
+
+	if !Client_ok {
 		return nil, errors.New("redis client is not a *redis.Client")
 	}
-	client.Do(w.ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s", w.Prefix, base64.StdEncoding.EncodeToString([]byte(w.Name))))
+
+	switch c := client.(type) {
+	case *redis.Client:
+		c.Do(w.ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s", w.Prefix, base64.StdEncoding.EncodeToString([]byte(w.Name))))
+	case *redis.ClusterClient:
+		c.Do(w.ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s", w.Prefix, base64.StdEncoding.EncodeToString([]byte(w.Name))))
+	default:
+		// handle error
+	}
 
 	w.scripts = newScripts(w.redisClient, w.ctx, w.KeyPrefix)
 

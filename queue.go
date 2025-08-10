@@ -415,7 +415,7 @@ func (q *Queue) addJob(ctx context.Context, job types.Job, jobId string) (string
 	finalJobId, ok := givenJobId.(string)
 	if !ok {
 		// This shouldn't happen based on Lua script, but handle defensively
-		return "", fmt.Errorf("Lua AddJob script returned unexpected type: %T", givenJobId)
+		return "", fmt.Errorf("lua AddJob script returned unexpected type: %T", givenJobId)
 	}
 
 	return finalJobId, nil

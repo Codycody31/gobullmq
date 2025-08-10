@@ -47,7 +47,7 @@ func main() {
 	worker, err := gobullmq.NewWorker(ctx, queueName, gobullmq.WorkerOptions{
 		Concurrency:     1,
 		StalledInterval: 30000,
-	}, redis.NewClient(redisOpts), workerProcess)
+	}, redis.NewClient(redisOpts), workerProcess, false)
 	if err != nil {
 		fmt.Println("Error initializing worker:", err)
 		return
