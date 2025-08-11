@@ -1,4 +1,5 @@
-<img width="1062" height="938" alt="image" src="https://github.com/user-attachments/assets/4c2c1537-b57f-4c47-8bb0-efb772213268" />
+<img width="1584" height="396" alt="_Blue Futuristic Technology LinkedIn Banner" src="https://github.com/user-attachments/assets/c7dd5f81-90f3-4adc-a8ec-a423c6cd5c97" />
+
 
 # BullMQ for Golang
 
