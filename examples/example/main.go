@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/redis/go-redis/v9"
 	"go.codycody31.dev/gobullmq"
@@ -29,8 +32,8 @@ func main() {
 		return
 	}
 
-	// Define the worker process function
-	workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+	// Define the worker process function (V2 with API)
+	workerProcess := func(ctx context.Context, job *types.Job, api gobullmq.WorkerProcessAPI) (interface{}, error) {
 		fmt.Printf("Processing job: %s\n", job.Id)
 		fmt.Printf("Data: %v\n", job.Data)
 
@@ -38,15 +41,24 @@ func main() {
 			fmt.Printf("Repeat job key: %s\n", job.RepeatJobKey)
 		}
 
-		// time.Sleep(5 * time.Second)
-		// return nil, errors.New("job failed")
-		return nil, nil
+		// Update progress example
+		_ = api.UpdateProgress(ctx, job.Id, 10)
+		// Extend lock example
+		_ = api.ExtendLock(ctx, job)
+
+		r, _ := rand.Int(rand.Reader, big.NewInt(100))
+		if r.Int64() < 50 {
+			return nil, errors.New("job failed")
+		}
+
+		return "ok", nil
 	}
 
-	// Initialize the worker
+	// Initialize the worker (now requires V2 processor)
 	worker, err := gobullmq.NewWorker(ctx, queueName, gobullmq.WorkerOptions{
 		Concurrency:     1,
 		StalledInterval: 30000,
+		Backoff:         &gobullmq.BackoffOptions{Type: "exponential", Delay: 500},
 	}, redis.NewClient(redisOpts), workerProcess)
 	if err != nil {
 		fmt.Println("Error initializing worker:", err)
@@ -87,8 +99,8 @@ func main() {
 
 	// Add jobs to the queue using the new Add signature
 	for i := 0; i < 10; i++ { // Reduced loop count for quicker testing
-		jobPayload.TaskID = i                               // Modify payload for each job
-		if _, err := queue.Add(ctx, "testJob", jobPayload); // Pass context and payload struct
+		jobPayload.TaskID = i                                                            // Modify payload for each job
+		if _, err := queue.Add(ctx, "testJob", jobPayload, gobullmq.AddWithAttempts(3)); // Pass context and payload struct
 		// Example functional options:
 		// gobullmq.AddWithDelay(1000*i), // Delay each job slightly differently
 		// gobullmq.AddWithPriority(i%3),
@@ -107,8 +119,20 @@ func main() {
 		fmt.Println("Error adding repeatable job:", err)
 	}
 
+	worker.On("completed", func(args ...interface{}) {
+		fmt.Println("Worker completed:", args)
+	})
+	worker.On("active", func(args ...interface{}) {
+		fmt.Println("Worker active:", args)
+	})
+	worker.On("added", func(args ...interface{}) {
+		fmt.Println("Worker added:", args)
+	})
 	worker.On("error", func(args ...interface{}) {
 		fmt.Println("Worker error:", args)
+	})
+	worker.On("failed", func(args ...interface{}) {
+		fmt.Println("Worker failed:", args)
 	})
 
 	// Run the worker

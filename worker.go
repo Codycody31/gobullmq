@@ -18,22 +18,22 @@ import (
 	"go.codycody31.dev/gobullmq/internal/fifoqueue"
 	"go.codycody31.dev/gobullmq/internal/lua"
 	"go.codycody31.dev/gobullmq/internal/utils"
+	backoffutil "go.codycody31.dev/gobullmq/internal/utils/backoff"
 	"go.codycody31.dev/gobullmq/types"
 )
-
-//type WorkerIface interface {
-//}
-//=
-//var _ WorkerIface = (*Worker)(nil)
 
 // TODO: Add metric tracking, allowing for storing of time per job, and other metrics
 // Including speed, throughput, largest/smallest job time, average rate of completion or failure, etc
 
-// TODO: At some point, expose a API to the processFn to allow it to extend the lock for a job
-// And perform other tasks, without having to call the worker, or redis directly
+// WorkerProcessWithAPI exposes helper methods to the processor
+type WorkerProcessAPI interface {
+	ExtendLock(ctx context.Context, job *types.Job) error
+	UpdateProgress(ctx context.Context, jobId string, progress interface{}) error
+	UpdateData(ctx context.Context, jobId string, data interface{}) error
+}
 
-// WorkerProcessFunc processFn is the function that processes the job
-type WorkerProcessFunc func(ctx context.Context, job *types.Job) (interface{}, error)
+// WorkerProcessFuncV2 receives an API alongside the job
+type WorkerProcessFunc func(ctx context.Context, job *types.Job, api WorkerProcessAPI) (interface{}, error)
 
 type Worker struct {
 	Name         string    // Name of the queue
@@ -82,6 +82,7 @@ type WorkerOptions struct {
 	LockDuration     int
 	LockRenewTime    int
 	RunRetryDelay    int
+	Backoff          *BackoffOptions
 }
 
 // type KeepJobs struct { // Moved to types/job.go
@@ -98,6 +99,12 @@ type MetricsOptions struct {
 	MaxDataPoints int
 }
 
+// BackoffOptions mirrors internal/utils/backoff.Options for configuration via WorkerOptions
+type BackoffOptions struct {
+	Type  string `json:"type" msgpack:"type"`
+	Delay int    `json:"delay" msgpack:"delay"`
+}
+
 type GetNextJobOptions struct {
 	Block bool
 }
@@ -110,6 +117,41 @@ type jobsInProgress struct {
 type jobInProgress struct {
 	job types.Job
 	ts  time.Time
+}
+
+// workerProcessAPI implements WorkerProcessAPI
+type workerProcessAPI struct {
+	w *Worker
+}
+
+func (api *workerProcessAPI) ExtendLock(ctx context.Context, job *types.Job) error {
+	if api.w == nil {
+		return fmt.Errorf("worker not initialized")
+	}
+	keys := []string{
+		api.w.KeyPrefix + "lock",
+		api.w.KeyPrefix + "stalled",
+	}
+	if job == nil {
+		return fmt.Errorf("job is nil")
+	}
+	// Use the job's lock token
+	_, err := lua.ExtendLock(api.w.redisClient, keys, job.Token, api.w.opts.LockDuration, job.Id)
+	return err
+}
+
+func (api *workerProcessAPI) UpdateProgress(ctx context.Context, jobId string, progress interface{}) error {
+	if api.w == nil || api.w.scripts == nil {
+		return fmt.Errorf("worker/scripts not initialized")
+	}
+	return api.w.scripts.updateProgress(jobId, progress)
+}
+
+func (api *workerProcessAPI) UpdateData(ctx context.Context, jobId string, data interface{}) error {
+	if api.w == nil || api.w.scripts == nil {
+		return fmt.Errorf("worker/scripts not initialized")
+	}
+	return api.w.scripts.updateData(jobId, data)
 }
 
 // NextJobData represents the structured data returned by raw2NextJobData
@@ -645,7 +687,8 @@ func (w *Worker) processJob(job types.Job, token string, fetchNextCallback func(
 			}
 		}()
 
-		result, err = w.processFn(w.ctx, &job)
+		api := &workerProcessAPI{w: w}
+		result, err = w.processFn(w.ctx, &job, api)
 	}()
 
 	// Remove job from jobsInProgress
@@ -654,6 +697,7 @@ func (w *Worker) processJob(job types.Job, token string, fetchNextCallback func(
 	w.jobsInProgress.Unlock()
 
 	if err != nil {
+		fmt.Println("Error processing job:", err)
 		if err.Error() == RateLimitError {
 			//this.limitUntil = await this.moveLimitedBackToWait(job, token);
 			return types.Job{}, err
@@ -663,81 +707,67 @@ func (w *Worker) processJob(job types.Job, token string, fetchNextCallback func(
 			return types.Job{}, err
 		}
 
-		if err != nil {
-			w.Emit("error", fmt.Sprintf("moving job to failed per: %v", err))
-			return types.Job{}, err
+		// Decide retry vs moveToFailed
+		shouldMoveToFailed := false
+
+		if job.AttemptsMade < job.Opts.Attempts {
+			// Calculate backoff delay
+			delayMs := 0
+			if w.opts.Backoff != nil {
+				delayMs = backoffutil.Calculate(backoffutil.Options{Type: w.opts.Backoff.Type, Delay: w.opts.Backoff.Delay}, job.AttemptsMade)
+			}
+
+			if delayMs > 0 {
+				// Move to delayed for backoff
+				keys, args := w.scripts.moveToDelayedArgs(job.Id, time.Now().UnixMilli()+int64(delayMs), token)
+				if _, derr := lua.MoveToDelayed(w.redisClient, keys, args...); derr != nil {
+					// If delaying fails, try immediate retry
+					w.Emit("error", fmt.Sprintf("moveToDelayed failed for %s: %v", job.Id, derr))
+					keysR, argsR := w.scripts.retryJobArgs(job.Id, job.Opts.Lifo, token)
+					if _, rerr := lua.RetryJob(w.redisClient, keysR, argsR...); rerr != nil {
+						w.Emit("error", fmt.Sprintf("retryJob failed for %s: %v", job.Id, rerr))
+						shouldMoveToFailed = true
+					} else {
+						w.Emit("failed", job, err, "active")
+						return types.Job{}, err
+					}
+				} else {
+					// Successfully delayed
+					w.Emit("failed", job, err, "active")
+					return types.Job{}, err
+				}
+			} else if delayMs == 0 {
+				// Retry immediately
+				keys, args := w.scripts.retryJobArgs(job.Id, job.Opts.Lifo, token)
+				if _, rerr := lua.RetryJob(w.redisClient, keys, args...); rerr != nil {
+					// If retry fails, fall back to moving to failed
+					w.Emit("error", fmt.Sprintf("retryJob failed for %s: %v", job.Id, rerr))
+					shouldMoveToFailed = true
+				} else {
+					// Emit failed for visibility and return without error so the worker continues
+					w.Emit("failed", job, err, "active")
+					return types.Job{}, err
+				}
+			} else { // delayMs < 0 -> do not retry
+				shouldMoveToFailed = true
+			}
+		} else {
+			shouldMoveToFailed = true
 		}
 
-		// job.moveToFailed
-		func(err error, token string) {
-			job.FailedReason = err.Error()
-
-			// this.saveStacktrace(multi,err);
-
-			//
-			// Check if an automatic retry should be performed
-			//
-			moveToFailed := false
-			// Variables declared here
-
-			if job.AttemptsMade < job.Opts.Attempts {
-				// const opts = queue.opts as WorkerOptions;
-
-				// // Check if backoff is needed
-				// const delay = await Backoffs.calculate(
-				//   <BackoffOptions>this.opts.backoff,
-				//   this.attemptsMade,
-				//   err,
-				//   this,
-				//   opts.settings && opts.settings.backoffStrategy,
-				// );
-
-				// if (delay === -1) {
-				//   moveToFailed = true;
-				// } else if (delay) {
-				//   const args = this.scripts.moveToDelayedArgs(
-				// 	this.id,
-				// 	Date.now() + delay,
-				// 	token,
-				//   );
-				//   (<any>multi).moveToDelayed(args);
-				//   command = 'delayed';
-				// } else {
-				//   // Retry immediately
-				//   (<any>multi).retryJob(
-				// 	this.scripts.retryJobArgs(this.id, this.opts.lifo, token),
-				//   );
-				//   command = 'retryJob';
-				// }
-			} else {
-				moveToFailed = true
+		if shouldMoveToFailed {
+			// Safely handle nil RemoveOnFail option
+			var removeOnFail types.KeepJobs
+			if w.opts.RemoveOnFail != nil {
+				removeOnFail = *w.opts.RemoveOnFail
 			}
-
-			if moveToFailed {
-				// Directly call the JobMoveToFailed function
-				if moveErr := JobMoveToFailed(w.scripts, &job, err, token, *w.opts.RemoveOnFail, fetchNextCallback()); moveErr != nil {
-					w.Emit("error", fmt.Sprintf("Error explicitly moving job %s to failed: %v", job.Id, moveErr))
-					// If moving to failed fails, we still need to return the original processing error
-				}
+			if moveErr := JobMoveToFailed(w.scripts, &job, err, token, removeOnFail, fetchNextCallback()); moveErr != nil {
+				w.Emit("error", fmt.Sprintf("Error explicitly moving job %s to failed: %v", job.Id, moveErr))
 			}
-		}(err, token)
-
-		w.Emit("failed", job, err, "active")
-
-		return types.Job{}, err
+			w.Emit("failed", job, err, "active")
+			return types.Job{}, err
+		}
 	}
-
-	// --- Job completed successfully --- //
-
-	// ---- Add Diagnostic Logging ----
-	// fmt.Printf("--- Job %s Completed Successfully ---\n", job.Id)
-	// fmt.Printf("Data Type: %T, Data Value: %v\n", job.Data, job.Data)
-	// if job.Opts.Repeat != nil {
-	// 	fmt.Printf("Repeat Options: %+v\n", *job.Opts.Repeat)
-	// } else {
-	// 	fmt.Println("Repeat Options: <nil>")
-	// }
-	// -------------------------------
 
 	// Check if this is a repeatable job and schedule the next one if needed
 	if job.Opts.Repeat != nil {
@@ -756,10 +786,6 @@ func (w *Worker) processJob(job types.Job, token string, fetchNextCallback func(
 				w.Emit("error", fmt.Sprintf("Failed to schedule next instance for repeatable job %s: %v", job.Id, scheduleErr))
 			}
 		}
-	} else {
-		// Add logging here to see if Repeat is nil
-		// fmt.Printf("Job %s completed, but Opts.Repeat is nil. Not rescheduling.\n", job.Id) // Keep commented
-		// fmt.Printf("Job Opts received by worker: %+v\n", job.Opts) // Optional detailed log
 	}
 
 	// Prepare args for moving job to completed state
@@ -934,7 +960,7 @@ func (w *Worker) resume() {
 
 // IsPaused returns true if the worker is paused
 func (w *Worker) IsPaused() bool {
-	return !!w.paused
+	return w.paused
 }
 
 // IsRunning returns true if the worker is running

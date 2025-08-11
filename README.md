@@ -3,6 +3,10 @@
 
 BullMQ for Golang is a powerful and flexible job queue library that allows you to manage and process jobs using Redis. It provides a robust set of features for creating, processing, and managing jobs in a distributed environment.
 
+## Supported Versions
+
+- BullMQ v4.12.2 - The current version of gobullmq is based on/compatible with BullMQ v4.12.2.
+
 ## Features
 
 - **Queue Management**: Create and manage job queues with ease.
@@ -27,49 +31,49 @@ Create a new queue and add jobs to it:
 
 ```go
 import (
-	"context"
-	"log"
+ "context"
+ "log"
 
-	"github.com/redis/go-redis/v9"
-	"go.codycody31.dev/gobullmq"
-	"go.codycody31.dev/gobullmq/types"
+ "github.com/redis/go-redis/v9"
+ "go.codycody31.dev/gobullmq"
+ "go.codycody31.dev/gobullmq/types"
 )
 
 func main() {
-	ctx := context.Background()
-	redisOpts := &redis.Options{
-		Addr: "127.0.0.1:6379", // Or your Redis server address
-		// Password: "your_password", // Uncomment if needed
-		DB: 0, // Default DB
-	}
+ ctx := context.Background()
+ redisOpts := &redis.Options{
+  Addr: "127.0.0.1:6379", // Or your Redis server address
+  // Password: "your_password", // Uncomment if needed
+  DB: 0, // Default DB
+ }
 
-	queue, err := gobullmq.NewQueue(ctx, "myQueue",
-		gobullmq.WithRedisOptions(redisOpts),
-		// Optional: Set a custom key prefix
-		// gobullmq.WithKeyPrefix("myCustomPrefix"),
-	)
-	if err != nil {
-		log.Fatalf("Failed to create queue: %v", err)
-	}
+ queue, err := gobullmq.NewQueue(ctx, "myQueue",
+  gobullmq.WithRedisOptions(redisOpts),
+  // Optional: Set a custom key prefix
+  // gobullmq.WithKeyPrefix("myCustomPrefix"),
+ )
+ if err != nil {
+  log.Fatalf("Failed to create queue: %v", err)
+ }
 
-	// Define job data (can be any struct that can be JSON marshaled)
-	jobData := struct {
-		Message string
-		Count   int
-	}{
-		Message: "Hello BullMQ!",
-		Count:   1,
-	}
+ // Define job data (can be any struct that can be JSON marshaled)
+ jobData := struct {
+  Message string
+  Count   int
+ }{
+  Message: "Hello BullMQ!",
+  Count:   1,
+ }
 
-	// Add a job using functional options
-	job, err := queue.Add(ctx, "myJob", jobData,
-		gobullmq.AddWithPriority(5),
-		gobullmq.AddWithDelay(2000), // Delay by 2 seconds
-	)
-	if err != nil {
-		log.Fatalf("Failed to add job: %v", err)
-	}
-	log.Printf("Added job %s with ID: %s\n", job.Name, job.Id)
+ // Add a job using functional options
+ job, err := queue.Add(ctx, "myJob", jobData,
+  gobullmq.AddWithPriority(5),
+  gobullmq.AddWithDelay(2000), // Delay by 2 seconds
+ )
+ if err != nil {
+  log.Fatalf("Failed to add job: %v", err)
+ }
+ log.Printf("Added job %s with ID: %s\n", job.Name, job.Id)
 }
 
 ```

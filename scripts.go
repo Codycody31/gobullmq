@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -119,6 +120,78 @@ func (s *scripts) moveToFinishedArgs(job *types.Job, value string, propValue str
 	return keys, args, nil
 }
 
+// retryJobArgs builds the keys and args for the retryJob Lua script call.
+func (s *scripts) retryJobArgs(jobId string, lifo bool, token string) ([]string, []interface{}) {
+	keys := []string{
+		s.keyPrefix + "active",
+		s.keyPrefix + "wait",
+		s.keyPrefix + "paused",
+		s.keyPrefix + jobId,
+		s.keyPrefix + "meta",
+		s.keyPrefix + "events",
+		s.keyPrefix + "delayed",
+		s.keyPrefix + "prioritized",
+		s.keyPrefix + "pc",
+	}
+
+	pushCmd := "LPUSH"
+	if lifo {
+		pushCmd = "RPUSH"
+	}
+
+	args := []interface{}{
+		s.keyPrefix,
+		time.Now().UnixMilli(),
+		pushCmd,
+		jobId,
+		token,
+	}
+
+	return keys, args
+}
+
+// moveToDelayedArgs builds the keys and args for the moveToDelayed Lua script call.
+// timestampMillis represents when the job should be retried (in ms).
+func (s *scripts) moveToDelayedArgs(jobId string, timestampMillis int64, token string) ([]string, []interface{}) {
+	// Normalize timestamp and bake in job id lower 12 bits like BullMQ
+	if timestampMillis < 0 {
+		timestampMillis = 0
+	}
+	var jobIdNumeric int64
+	if parsed, err := strconv.ParseInt(jobId, 10, 64); err == nil {
+		jobIdNumeric = parsed
+	} else {
+		jobIdNumeric = 0
+	}
+	var score int64
+	if timestampMillis > 0 {
+		score = timestampMillis*0x1000 + (jobIdNumeric & 0xfff)
+	} else {
+		score = 0
+	}
+
+	keys := []string{
+		s.keyPrefix + "wait",
+		s.keyPrefix + "active",
+		s.keyPrefix + "prioritized",
+		s.keyPrefix + "delayed",
+		s.keyPrefix + jobId,
+		s.keyPrefix + "events",
+		s.keyPrefix + "paused",
+		s.keyPrefix + "meta",
+	}
+
+	args := []interface{}{
+		s.keyPrefix,
+		time.Now().UnixMilli(),
+		fmt.Sprintf("%d", score),
+		jobId,
+		token,
+	}
+
+	return keys, args
+}
+
 // UpdateProgress updates the progress of a job
 func (s *scripts) updateProgress(jobId string, progress interface{}) error {
 	keys := []string{
@@ -145,5 +218,30 @@ func (s *scripts) updateProgress(jobId string, progress interface{}) error {
 		return fmt.Errorf("job not found")
 	}
 
+	return nil
+}
+
+// updateData updates the job's data field atomically in Redis
+func (s *scripts) updateData(jobId string, data interface{}) error {
+	keys := []string{
+		s.keyPrefix + jobId,
+	}
+
+	dataJson, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+
+	result, err := lua.UpdateData(s.redisClient, keys, string(dataJson))
+	if err != nil {
+		return err
+	}
+	resultInt64, ok := result.(int64)
+	if !ok {
+		return fmt.Errorf("invalid result type: %T", result)
+	}
+	if resultInt64 == -1 {
+		return fmt.Errorf("job not found")
+	}
 	return nil
 }

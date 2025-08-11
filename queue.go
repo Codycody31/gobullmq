@@ -277,8 +277,7 @@ func (q *Queue) Add(ctx context.Context, jobName string, jobData interface{}, ad
 	}
 	job.Id = jobId
 
-	// TODO: Consider making event emission asynchronous?
-	q.Emit("waiting", job) // Emit job struct itself, or maybe just ID and name?
+	q.Emit("waiting", job)
 
 	return job, nil
 }

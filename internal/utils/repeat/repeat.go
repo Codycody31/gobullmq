@@ -2,17 +2,18 @@ package repeat
 
 import (
 	"fmt"
-	"github.com/gorhill/cronexpr"
-	"go.codycody31.dev/gobullmq/internal/utils"
-	"go.codycody31.dev/gobullmq/types"
 	"math"
 	"strconv"
 	"time"
+
+	"github.com/gorhill/cronexpr"
+	"go.codycody31.dev/gobullmq/internal/utils"
+	"go.codycody31.dev/gobullmq/types"
 )
 
 // GetJobId returns the job id
 func GetJobId(name string, nextMillis int64, namespace string, jobId string) (string, error) {
-	checksum := utils.MD5Hash(fmt.Sprintf("%s:%d:%s", name, jobId, namespace))
+	checksum := utils.MD5Hash(fmt.Sprintf("%s:%s:%s", name, jobId, namespace))
 	return fmt.Sprintf("repeat:%s:%s", checksum, strconv.FormatInt(nextMillis, 10)), nil
 }
 
