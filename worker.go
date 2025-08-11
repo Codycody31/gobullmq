@@ -36,22 +36,21 @@ type WorkerProcessAPI interface {
 type WorkerProcessFunc func(ctx context.Context, job *types.Job, api WorkerProcessAPI) (interface{}, error)
 
 type Worker struct {
-	Name         string    // Name of the queue
-	Token        uuid.UUID // Token used to identify the queue events
-	ee           *eventemitter.EventEmitter
-	running      bool               // Flag to indicate if the queue events is running
-	closing      bool               // Flag to indicate if the queue events is closing
-	paused       bool               // Flag to indicate if the queue events is paused
-	redisClient  redis.Cmdable      // Redis client used to interact with the redis server
-	ctx          context.Context    // Context used to handle the queue events
-	cancel       context.CancelFunc // Cancel function used to stop the queue events
-	Prefix       string
-	KeyPrefix    string
-	mutex        sync.Mutex     // Mutex used to lock/unlock the queue events
-	wg           sync.WaitGroup // WaitGroup used to wait for the queue events to finish
-	opts         WorkerOptions
-	processFn    WorkerProcessFunc
-	resumeWorker func()
+	Name        string    // Name of the queue
+	Token       uuid.UUID // Token used to identify the queue events
+	ee          *eventemitter.EventEmitter
+	running     bool               // Flag to indicate if the queue events is running
+	closing     bool               // Flag to indicate if the queue events is closing
+	paused      bool               // Flag to indicate if the queue events is paused
+	redisClient redis.Cmdable      // Redis client used to interact with the redis server
+	ctx         context.Context    // Context used to handle the queue events
+	cancel      context.CancelFunc // Cancel function used to stop the queue events
+	Prefix      string
+	KeyPrefix   string
+	mutex       sync.Mutex     // Mutex used to lock/unlock the queue events
+	wg          sync.WaitGroup // WaitGroup used to wait for the queue events to finish
+	opts        WorkerOptions
+	processFn   WorkerProcessFunc
 
 	// Locks
 	extendLocksTimer  *time.Timer
@@ -938,24 +937,23 @@ func (w *Worker) processJob(job types.Job, token string, fetchNextCallback func(
 	return types.Job{}, nil
 }
 
-// TODO: pause
-func (w *Worker) pause() {
+func (w *Worker) Pause() {
 	if w.paused {
 		return
 	}
-
-	// await (!doNotWaitActive && this.whenCurrentJobsFinished());
 
 	w.paused = true
 	w.Emit("paused")
 }
 
-// Resume resumes processing of this worker (if paused).
-func (w *Worker) resume() {
-	if w.resumeWorker != nil {
-		w.resumeWorker()
-		w.Emit("resumed")
+// Resume resumes processing of this worker (if paused)
+func (w *Worker) Resume() {
+	if !w.paused {
+		return
 	}
+
+	w.paused = false
+	w.Emit("resumed")
 }
 
 // IsPaused returns true if the worker is paused

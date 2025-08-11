@@ -32,7 +32,7 @@ type QueueEvents struct {
 	ee          *eventemitter.EventEmitter // Event emitter used to handle events occuring in worker threads/go routines/etc
 	running     bool                       // Flag to indicate if the queue events is running
 	closing     bool                       // Flag to indicate if the queue events is closing
-	redisClient redis.Client               // Redis client used to interact with the redis server
+	redisClient redis.Cmdable              // Redis client used to interact with the redis server
 	ctx         context.Context            // Context used to handle the queue events
 	cancel      context.CancelFunc         // Cancel function used to stop the queue events
 	Prefix      string
@@ -45,9 +45,9 @@ type QueueEvents struct {
 }
 
 type QueueEventsOptions struct {
-	RedisClient redis.Client // Assume we have been handled a working and valid redis con
-	Autorun     bool         // If true, run the queue events immediately after creation
-	Prefix      string       // Prefix for the queue events key
+	RedisClient redis.Cmdable // Provided working redis client
+	Autorun     bool          // If true, run the queue events immediately after creation
+	Prefix      string        // Prefix for the queue events key
 }
 
 // NewQueueEvents creates a new QueueEvents instance
@@ -115,8 +115,15 @@ func (qe *QueueEvents) Run() error {
 
 	qe.running = true
 	client := qe.redisClient
-
-	client.Do(qe.ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s%s", qe.Prefix, base64.StdEncoding.EncodeToString([]byte(qe.Name)), ":qe"))
+	// Set client name on provided client(s), handling both single and cluster
+	switch c := client.(type) {
+	case *redis.Client:
+		_ = c.Do(qe.ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s%s", qe.Prefix, base64.StdEncoding.EncodeToString([]byte(qe.Name)), ":qe")).Err()
+	case *redis.ClusterClient:
+		_ = c.ForEachShard(qe.ctx, func(ctx context.Context, shardClient *redis.Client) error {
+			return shardClient.Do(ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s%s", qe.Prefix, base64.StdEncoding.EncodeToString([]byte(qe.Name)), ":qe")).Err()
+		})
+	}
 
 	qe.wg.Add(1)
 
@@ -135,7 +142,7 @@ func (qe *QueueEvents) Run() error {
 }
 
 // consumeEvents consumes events from the redis stream
-func (qe *QueueEvents) consumeEvents(client redis.Client) error {
+func (qe *QueueEvents) consumeEvents(client redis.Cmdable) error {
 	eventKey := qe.KeyPrefix + "events"
 	id := "$"
 	if qe.Opts.LastEventId != "" {

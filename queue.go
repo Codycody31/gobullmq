@@ -64,17 +64,6 @@ type Queue struct {
 // QueueOption holds configuration options for creating a new Queue.
 // Renamed from the original QueueOption to avoid conflict with the functional option type.
 type QueueOptions struct {
-	// RedisOpts specifies the connection options for the Redis client.
-	// It's recommended to provide this instead of separate IP/Passwd/Mode.
-	RedisOpts *redis.Options
-
-	// DEPRECATED: Use RedisOpts instead.
-	Mode int
-	// DEPRECATED: Use RedisOpts instead.
-	RedisIp string
-	// DEPRECATED: Use RedisOpts instead.
-	RedisPasswd string
-
 	// KeyPrefix is the prefix used for all Redis keys associated with this queue.
 	// Defaults to "bull" if empty.
 	KeyPrefix string
@@ -95,7 +84,7 @@ type QueueJob struct {
 
 // NewQueue creates a new Queue instance with the specified context, name, and options.
 // It uses the functional options pattern for configuration.
-func NewQueue(ctx context.Context, name string, functionalOpts ...QueueFunctionalOption) (*Queue, error) {
+func NewQueue(ctx context.Context, name string, client redis.Cmdable, functionalOpts ...QueueFunctionalOption) (*Queue, error) {
 	if name == "" {
 		return nil, fmt.Errorf("queue name must be provided")
 	}
@@ -112,9 +101,10 @@ func NewQueue(ctx context.Context, name string, functionalOpts ...QueueFunctiona
 	}
 
 	q := &Queue{
-		Name:  name,
-		Token: uuid.New(),
-		ctx:   ctx,
+		Name:   name,
+		Token:  uuid.New(),
+		ctx:    ctx,
+		Client: client,
 	}
 
 	q.EventEmitter.Init()
@@ -122,34 +112,6 @@ func NewQueue(ctx context.Context, name string, functionalOpts ...QueueFunctiona
 	q.KeyPrefix = opts.KeyPrefix // Use the resolved prefix
 	q.Prefix = q.KeyPrefix
 	q.KeyPrefix = q.KeyPrefix + ":" + name + ":"
-
-	// --- Redis Client Initialization ---
-	var redisClient redis.Cmdable
-	var err error
-
-	if opts.RedisOpts != nil {
-		// Preferred method: Use provided redis.Options
-		// TODO: Add support for different Redis client types (Cluster, Sentinel) if needed
-		redisClient = redis.NewClient(opts.RedisOpts)
-	} else if opts.RedisIp != "" {
-		// Legacy/Deprecated method: Use individual fields
-		// This uses the internal redisAction.Init, which might need refactoring later
-		// to directly return a Cmdable based on redis.Options.
-		redisClient, err = redisAction.Init(opts.RedisIp, opts.RedisPasswd, opts.Mode)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize Redis client using legacy options: %w", err)
-		}
-	} else {
-		// No Redis options provided, try connecting to default localhost
-		// Or return an error, depending on desired behavior.
-		// For now, let's assume default localhost might work.
-		redisClient = redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-		// Or return an error:
-		// return nil, fmt.Errorf("Redis connection options must be provided either via RedisOpts or legacy fields")
-	}
-
-	q.Client = redisClient
-	// --- End Redis Client Initialization ---
 
 	// Check connection
 	if err := q.Ping(); err != nil {
@@ -170,15 +132,6 @@ func NewQueue(ctx context.Context, name string, functionalOpts ...QueueFunctiona
 	return q, nil
 }
 
-// --- Functional Options for NewQueue ---
-
-// WithRedisOptions specifies the Redis connection options.
-func WithRedisOptions(redisOpts *redis.Options) QueueFunctionalOption {
-	return func(opts *QueueOptions) {
-		opts.RedisOpts = redisOpts
-	}
-}
-
 // WithKeyPrefix sets the key prefix for Redis keys.
 func WithKeyPrefix(prefix string) QueueFunctionalOption {
 	return func(opts *QueueOptions) {
@@ -197,32 +150,9 @@ func WithStreamsEventsMaxLen(maxLen int64) QueueFunctionalOption {
 	}
 }
 
-// DEPRECATED: Use WithRedisOptions instead.
-func WithLegacyRedisConfig(ip string, password string, mode int) QueueFunctionalOption {
-	return func(opts *QueueOptions) {
-		opts.RedisIp = ip
-		opts.RedisPasswd = password
-		opts.Mode = mode
-	}
-}
-
-// --- End Functional Options ---
-
-// Init initializes a new Queue instance with the specified context, name, and options.
-// DEPRECATED: Use NewQueue directly with functional options.
+// Init is deprecated. Provide a client via NewQueue instead.
 func (q *Queue) Init(ctx context.Context, name string, legacyOpts QueueOptions) (*Queue, error) {
-	// Convert legacy options to functional options for compatibility
-	functionalOpts := []QueueFunctionalOption{
-		WithKeyPrefix(legacyOpts.KeyPrefix),
-		WithStreamsEventsMaxLen(legacyOpts.StreamsEventsMaxLen),
-	}
-	if legacyOpts.RedisOpts != nil {
-		functionalOpts = append(functionalOpts, WithRedisOptions(legacyOpts.RedisOpts))
-	} else if legacyOpts.RedisIp != "" {
-		functionalOpts = append(functionalOpts, WithLegacyRedisConfig(legacyOpts.RedisIp, legacyOpts.RedisPasswd, legacyOpts.Mode))
-	}
-
-	return NewQueue(ctx, name, functionalOpts...)
+	return nil, fmt.Errorf("queue.Init is deprecated: use NewQueue(ctx, name, client, opts...) with an existing redis client")
 }
 
 // Add adds a new job to the queue with the specified name, data, and functional options.
@@ -530,7 +460,6 @@ func calculateNextMillis(lastExecMillis int64, opts *types.JobRepeatOptions) (in
 		return 0, nil // Not a repeat job
 	}
 
-	// --- Check Stop Conditions --- //
 	// Limit
 	if opts.Limit > 0 && opts.Count >= opts.Limit {
 		return 0, nil // Limit reached
@@ -541,7 +470,6 @@ func calculateNextMillis(lastExecMillis int64, opts *types.JobRepeatOptions) (in
 		return 0, nil // End date passed
 	}
 
-	// --- Calculate Next Time --- //
 	var next time.Time
 	baseTime := time.UnixMilli(lastExecMillis)
 
@@ -574,7 +502,6 @@ func calculateNextMillis(lastExecMillis int64, opts *types.JobRepeatOptions) (in
 		return 0, nil // No valid repeat definition
 	}
 
-	// --- Check StartDate and EndDate again against the calculated next time --- //
 	if opts.StartDate != nil && next.Before(*opts.StartDate) {
 		// If next calculated time is before start date, recalculate based on start date
 		// (This might be complex for cron, might need adjustment based on desired behavior)

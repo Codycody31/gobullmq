@@ -23,10 +23,13 @@ func main() {
 		DB: 0, // Default DB
 	}
 
+	// Create separate redis clients for queue, worker, and events to avoid CLIENT SETNAME clashes
+	queueClient := redis.NewClient(redisOpts)
+	workerClient := redis.NewClient(redisOpts)
+	eventsClient := redis.NewClient(redisOpts)
+
 	// Initialize the queue using functional options
-	queue, err := gobullmq.NewQueue(ctx, queueName,
-		gobullmq.WithRedisOptions(redisOpts),
-	)
+	queue, err := gobullmq.NewQueue(ctx, queueName, queueClient)
 	if err != nil {
 		fmt.Println("Error initializing queue:", err)
 		return
@@ -59,7 +62,7 @@ func main() {
 		Concurrency:     1,
 		StalledInterval: 30000,
 		Backoff:         &gobullmq.BackoffOptions{Type: "exponential", Delay: 500},
-	}, redis.NewClient(redisOpts), workerProcess)
+	}, workerClient, workerProcess)
 	if err != nil {
 		fmt.Println("Error initializing worker:", err)
 		return
@@ -67,7 +70,7 @@ func main() {
 
 	// Initialize queue events
 	events, err := gobullmq.NewQueueEvents(ctx, queueName, gobullmq.QueueEventsOptions{
-		RedisClient: *redis.NewClient(redisOpts),
+		RedisClient: eventsClient,
 		Autorun:     true,
 	})
 	if err != nil {

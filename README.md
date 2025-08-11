@@ -27,74 +27,69 @@ go get go.codycody31.dev/gobullmq
 
 ### Queue
 
-Create a new queue and add jobs to it:
+Create a new queue and add jobs to it. Note: you must provide your own Redis client.
 
 ```go
 import (
- "context"
- "log"
+  "context"
+  "log"
 
- "github.com/redis/go-redis/v9"
- "go.codycody31.dev/gobullmq"
- "go.codycody31.dev/gobullmq/types"
+  "github.com/redis/go-redis/v9"
+  "go.codycody31.dev/gobullmq"
+  "go.codycody31.dev/gobullmq/types"
 )
 
 func main() {
- ctx := context.Background()
- redisOpts := &redis.Options{
-  Addr: "127.0.0.1:6379", // Or your Redis server address
-  // Password: "your_password", // Uncomment if needed
-  DB: 0, // Default DB
- }
+  ctx := context.Background()
+  queueClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
 
- queue, err := gobullmq.NewQueue(ctx, "myQueue",
-  gobullmq.WithRedisOptions(redisOpts),
-  // Optional: Set a custom key prefix
-  // gobullmq.WithKeyPrefix("myCustomPrefix"),
- )
- if err != nil {
-  log.Fatalf("Failed to create queue: %v", err)
- }
+  queue, err := gobullmq.NewQueue(ctx, "myQueue", queueClient,
+    // Optional: Set a custom key prefix
+    gobullmq.WithKeyPrefix("myCustomPrefix"),
+  )
+  if err != nil {
+    log.Fatalf("Failed to create queue: %v", err)
+  }
 
- // Define job data (can be any struct that can be JSON marshaled)
- jobData := struct {
-  Message string
-  Count   int
- }{
-  Message: "Hello BullMQ!",
-  Count:   1,
- }
+  // Define job data (can be any struct that can be JSON marshaled)
+  jobData := struct {
+    Message string
+    Count   int
+  }{
+    Message: "Hello BullMQ!",
+    Count:   1,
+  }
 
- // Add a job using functional options
- job, err := queue.Add(ctx, "myJob", jobData,
-  gobullmq.AddWithPriority(5),
-  gobullmq.AddWithDelay(2000), // Delay by 2 seconds
- )
- if err != nil {
-  log.Fatalf("Failed to add job: %v", err)
- }
- log.Printf("Added job %s with ID: %s\n", job.Name, job.Id)
+  // Add a job using functional options
+  job, err := queue.Add(ctx, "myJob", jobData,
+    gobullmq.AddWithPriority(5),
+    gobullmq.AddWithDelay(2000), // Delay by 2 seconds
+  )
+  if err != nil {
+    log.Fatalf("Failed to add job: %v", err)
+  }
+  log.Printf("Added job %s with ID: %s\n", job.Name, job.Id)
 }
-
 ```
 
 ### Worker
 
-Define a worker to process jobs from the queue:
+Define a worker to process jobs from the queue. Note: use a separate Redis client from the queue and events to avoid CLIENT SETNAME collisions.
 
 ```go
-workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+workerClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
+
+workerProcess := func(ctx context.Context, job *types.Job, api gobullmq.WorkerProcessAPI) (interface{}, error) {
     fmt.Printf("Processing job: %s\n", job.Name)
-    return nil, nil
+    _ = api.UpdateProgress(ctx, job.Id, 25)
+    return "ok", nil
 }
 
 worker, err := gobullmq.NewWorker(ctx, "myQueue", gobullmq.WorkerOptions{
     Concurrency:     1,
     StalledInterval: 30000,
-}, redis.NewClient(&redis.Options{
-    Addr:     "127.0.0.1:6379",
-    Password: "",
-}), workerProcess)
+    Backoff:         &gobullmq.BackoffOptions{Type: "exponential", Delay: 500},
+}, workerClient, workerProcess)
 if err != nil {
     log.Fatal(err)
 }
@@ -124,11 +119,11 @@ func main() {
 	}
 	fmt.Println("Connected to Redis Cluster")
 
-	// Define the worker process function
-	workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+    // Define the worker process function
+    workerProcess := func(ctx context.Context, job *types.Job, api gobullmq.WorkerProcessAPI) (interface{}, error) {
 		fmt.Printf("job.Data type: %T, value: %v\n", job.Data, job.Data)
 
-		return nil, nil
+        return "ok", nil
 	}
 
 	// Initialize the worker with Redis cluster connection
@@ -173,16 +168,13 @@ func main() {
 
 ### QueueEvents
 
-Listen to events emitted by the queue:
+Listen to events emitted by the queue. Use a separate Redis client:
 
 ```go
+eventsClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
 events, err := gobullmq.NewQueueEvents(ctx, "myQueue", gobullmq.QueueEventsOptions{
-    RedisClient: *redis.NewClient(&redis.Options{
-        Addr:     "127.0.0.1:6379",
-        Password: "",
-        DB:       0,
-    }),
-    Autorun: true,
+    RedisClient: eventsClient,
+    Autorun:     true,
 })
 if err != nil {
     log.Fatal(err)
@@ -199,19 +191,22 @@ events.On("error", func(args ...interface{}) {
 
 ## Configuration
 
-Configuration is primarily done using functional options passed to `NewQueue`, `NewWorker`, and `NewQueueEvents`.
+Configuration is primarily done using functional options passed to `NewQueue`, `NewWorker`, and `NewQueueEvents`. You must construct and pass your own `redis.Cmdable` (e.g., `*redis.Client` or `*redis.ClusterClient`).
 
 ### Queue Functional Options
 
-- `WithRedisOptions(*redis.Options)`: **Recommended**. Sets the Redis connection options using a `redis.Options` struct.
 - `WithKeyPrefix(string)`: Sets a custom prefix for Redis keys (default is "bull").
 - `WithStreamsEventsMaxLen(int64)`: Sets the maximum length for the events stream (default 10000).
-- `WithLegacyRedisConfig(ip, password, mode)`: **DEPRECATED**. Use `WithRedisOptions` instead.
 
 ### Worker Options
 
 - `Concurrency`: The number of concurrent jobs the worker can process.
 - `StalledInterval`: The interval for checking stalled jobs.
+- `Backoff`: Configure retry backoff behavior (e.g., `{Type: "fixed"|"exponential", Delay: ms}`).
+
+### Important note on Redis clients
+
+- Use three separate Redis clients in your app: one each for `Queue`, `Worker`, and `QueueEvents`. This avoids `CLIENT SETNAME` overwrites, as each component sets a distinct client name.
 
 ### QueueEvents Options
 
