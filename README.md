@@ -1,3 +1,5 @@
+<img width="1062" height="938" alt="image" src="https://github.com/user-attachments/assets/4c2c1537-b57f-4c47-8bb0-efb772213268" />
+
 # BullMQ for Golang
 
 BullMQ for Golang is a powerful and flexible job queue library that allows you to manage and process jobs using Redis. It provides a robust set of features for creating, processing, and managing jobs in a distributed environment.
