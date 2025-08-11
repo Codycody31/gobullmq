@@ -1,5 +1,3 @@
-<img width="1584" height="396" alt="_Blue Futuristic Technology LinkedIn Banner" src="https://github.com/user-attachments/assets/c7dd5f81-90f3-4adc-a8ec-a423c6cd5c97" />
-
 
 # BullMQ for Golang
 
@@ -152,11 +150,11 @@ func main() {
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
 	// Run the worker in a goroutine
-	go func() {
+	
 		if err := worker.Run(); err != nil {
 			log.Printf("Worker error: %v", err)
 		}
-	}()
+
 
 	// Wait for interrupt signal
 	<-c
