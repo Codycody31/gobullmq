@@ -6,11 +6,12 @@ This system allows developers to create robust background processing capabilitie
 
 ## Queue Creation and Initialization
 
-The `Queue` struct represents a job queue. A new queue is created using the `NewQueue` function, which takes a context, a queue name, and functional options as parameters. These options configure the Redis connection and other queue-specific settings.
+The `Queue` struct represents a job queue. A new queue is created using the `NewQueue` function, which takes a context, a queue name, your Redis client, and functional options as parameters.
 
 ```go
-queue, err := gobullmq.NewQueue(ctx, queueName,
-	gobullmq.WithRedisOptions(redisOpts),
+queueClient := redis.NewClient(redisOpts)
+queue, err := gobullmq.NewQueue(ctx, queueName, queueClient,
+    // gobullmq.WithKeyPrefix("myCustomPrefix"),
 )
 if err != nil {
 	fmt.Println("Error initializing queue:", err)
@@ -18,32 +19,29 @@ if err != nil {
 }
 ```
 
-
-The `QueueOptions` struct defines the available configuration options, including Redis connection details, key prefixes, and stream event maximum lengths. Functional options like `WithRedisOptions`, `WithKeyPrefix`, and `WithStreamsEventsMaxLen` are used to apply these configurations.
+Functional options like `WithKeyPrefix` and `WithStreamsEventsMaxLen` are used to configure key prefixing and stream trimming.
 
 ### Functional Options
 
 Functional options provide a flexible way to configure the queue during initialization. Here's a breakdown of the available options:
 
-*   **`WithRedisOptions(*redis.Options)`**: Sets the Redis connection options using a `redis.Options` struct. This is the recommended way to configure the Redis connection.
-*   **`WithKeyPrefix(string)`**: Sets a custom prefix for Redis keys. The default prefix is "bull".
-*   **`WithStreamsEventsMaxLen(int64)`**: Sets the maximum length for the events stream. The default value is 10000.
-*   **`WithLegacyRedisConfig(ip string, password string, mode int)`**: DEPRECATED: Use `WithRedisOptions` instead.
+- **`WithKeyPrefix(string)`**: Sets a custom prefix for Redis keys. The default prefix is "bull".
+- **`WithStreamsEventsMaxLen(int64)`**: Sets the maximum length for the events stream. The default value is 10000.
 
-### Redis Client Initialization
+### Redis Client
 
-The `NewQueue` function initializes the Redis client using the provided options. It supports both the recommended `redis.Options` struct and the deprecated individual fields (`RedisIp`, `RedisPasswd`, `Mode`). If no Redis options are provided, it attempts to connect to the default localhost.
+You are responsible for constructing and passing a `redis.Cmdable` (e.g., `*redis.Client` or `*redis.ClusterClient`). This library does not create connections for you.
 
 ### Queue Properties
 
-| Property  | Type          | Description                                                                                                                               | Source                                                                                                                            |
-| --------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `Name`    | `string`      | The name of the queue.                                                                                                                    |                                                                                                                 |
-| `Token`   | `uuid.UUID`   | A unique identifier for the queue instance.                                                                                             |                                                                                                                 |
-| `KeyPrefix` | `string`      | The prefix used for all Redis keys associated with the queue.                                                                            |                                                                                                                 |
-| `Client`  | `redis.Cmdable` | The Redis client used to interact with the Redis server.                                                                                |                                                                                                                 |
-| `Prefix`  | `string`      | The prefix used for all Redis keys associated with the queue.                                                                            |                                                                                                                 |
-| `ctx`     | `context.Context` | The context used for managing the lifecycle of the queue.                                                                                |                                                                                                                 |
+| Property    | Type              | Description                                                   |
+| ----------- | ----------------- | ------------------------------------------------------------- |
+| `Name`      | `string`          | The name of the queue.                                        |
+| `Token`     | `uuid.UUID`       | A unique identifier for the queue instance.                   |
+| `KeyPrefix` | `string`          | The prefix used for all Redis keys associated with the queue. |
+| `Client`    | `redis.Cmdable`   | The Redis client used to interact with the Redis server.      |
+| `Prefix`    | `string`          | The prefix used for all Redis keys associated with the queue. |
+| `ctx`       | `context.Context` | The context used for managing the lifecycle of the queue.     |
 
 ### Initialization Sequence Diagram
 
@@ -89,23 +87,22 @@ if err != nil {
 log.Printf("Added job %s with ID: %s\n", job.Name, job.Id)
 ```
 
-
 ### Job Options
 
 The behavior of a job can be configured using functional options passed to the `Add` method. These options include:
 
-*   **`AddWithPriority(priority int)`**: Sets the priority for the job. Lower numbers indicate higher priority.
-*   **`AddWithRemoveOnComplete(keep ...types.KeepJobs)`**: Configures job removal upon successful completion.
-*   **`AddWithRemoveOnFail(keep ...types.KeepJobs)`**: Configures job removal upon failure.
-*   **`AddWithAttempts(times int)`**: Sets the maximum number of attempts for the job.
-*   **`AddWithDelay(delayMillis int)`**: Sets an initial delay (in milliseconds) before the job can be processed.
-*   **`AddWithTimestamp(tsMillis int64)`**: Sets a custom timestamp for the job.
-*   **`AddWithJobID(id string)`**: Sets a specific ID for the job. Use with caution, as IDs must be unique.
-*   **`AddWithRepeat(repeatOpts types.JobRepeatOptions)`**: Configures the job to repeat based on the provided options.
-*   **`AddWithLifo()`**: Adds the job using LIFO (Last In, First Out) order.
-*   **`AddWithFailParentOnFailure(fail bool)`**: Marks the job to fail its parent job if this job fails.
-*   **`AddWithParent(parentOpts types.ParentOpts)`**: Sets the parent job information for this job.
-*   **`AddWithRemoveDependencyOnFailure(remove bool)`**: Marks the job's dependency to be removed from its parent even if this job fails.
+- **`AddWithPriority(priority int)`**: Sets the priority for the job. Lower numbers indicate higher priority.
+- **`AddWithRemoveOnComplete(keep ...types.KeepJobs)`**: Configures job removal upon successful completion.
+- **`AddWithRemoveOnFail(keep ...types.KeepJobs)`**: Configures job removal upon failure.
+- **`AddWithAttempts(times int)`**: Sets the maximum number of attempts for the job.
+- **`AddWithDelay(delayMillis int)`**: Sets an initial delay (in milliseconds) before the job can be processed.
+- **`AddWithTimestamp(tsMillis int64)`**: Sets a custom timestamp for the job.
+- **`AddWithJobID(id string)`**: Sets a specific ID for the job. Use with caution, as IDs must be unique.
+- **`AddWithRepeat(repeatOpts types.JobRepeatOptions)`**: Configures the job to repeat based on the provided options.
+- **`AddWithLifo()`**: Adds the job using LIFO (Last In, First Out) order.
+- **`AddWithFailParentOnFailure(fail bool)`**: Marks the job to fail its parent job if this job fails.
+- **`AddWithParent(parentOpts types.ParentOpts)`**: Sets the parent job information for this job.
+- **`AddWithRemoveDependencyOnFailure(remove bool)`**: Marks the job's dependency to be removed from its parent even if this job fails.
 
 ### Job Creation Process
 
@@ -169,7 +166,6 @@ func (q *Queue) Resume(ctx context.Context) error { // Added context
 }
 ```
 
-
 ### Pause/Resume Implementation
 
 The `pause` method is a helper function that performs the actual pausing or resuming of the queue. It takes a context and a boolean flag indicating whether to pause or resume. The method uses a Lua script to move jobs between the "wait" and "paused" queues.
@@ -185,7 +181,6 @@ func (q *Queue) IsPaused(ctx context.Context) (bool, error) { // Added context a
 	return pausedKeyExists, err
 }
 ```
-
 
 ### Pause/Resume Sequence Diagram
 
@@ -255,7 +250,3 @@ sequenceDiagram
 ```
 
 This diagram illustrates the sequence of steps involved in running the queue events, including reading messages from the Redis stream and processing each event.
-
-## Conclusion
-
-Queue Management in `gobullmq` provides a comprehensive set of features for managing and processing jobs in a distributed environment. It offers functionalities for queue creation, job addition, queue pausing/resuming, and event handling, making it a versatile tool for building robust background processing systems. The use of Redis ensures persistence and reliability, while the functional options pattern provides a flexible way to configure the queue.

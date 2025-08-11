@@ -35,28 +35,6 @@ export default defineConfig({
       link: "/customization",
     },
     {
-      text: "Architecture",
-      items: [
-        { text: "Overview", link: "/architecture/overview" },
-        {
-          text: "Redis Interaction",
-          link: "/architecture/redis-interaction",
-        },
-        {
-          text: "Redis Data Structures",
-          link: "/architecture/redis-data-structures",
-        },
-        {
-          text: "Data Flow",
-          link: "/architecture/data-flow",
-        },
-        {
-          text: "Lua Scripting",
-          link: "/architecture/lua-scripting",
-        },
-      ],
-    },
-    {
       text: "API",
       items: [
         {

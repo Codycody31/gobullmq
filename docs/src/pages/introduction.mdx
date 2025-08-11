@@ -1,18 +1,3 @@
-## Introduction
-
-<details>
-<summary>Relevant source files</summary>
-
-The following files were used as context for generating this wiki page:
-
-- [README.md](README.md)
-- [examples/example/main.go](examples/example/main.go)
-- [job.go](job.go)
-- [queue.go](queue.go)
-- [scripts.go](scripts.go)
-- [internal/lua/addJob_lua.go](internal/lua/addJob_lua.go)
-</details>
-
 # Introduction
 
 The `gobullmq` library provides a robust job queue system for Golang, leveraging Redis for managing and processing jobs. It offers features for creating queues, defining workers to process jobs concurrently, handling events during the job lifecycle, and scheduling repeatable jobs. The library aims to simplify the implementation of background tasks and distributed processing in Go applications.
@@ -25,11 +10,11 @@ The `Queue` component in `gobullmq` is responsible for managing the job queue. I
 
 ### Creating a Queue
 
-A new queue can be created using the `NewQueue` function. This function takes the queue name and a set of functional options as arguments. The functional options allow you to configure the queue's behavior, such as setting the Redis connection options and key prefix.
+Create a queue by providing your own Redis client (e.g., `*redis.Client`) and optional functional options like a custom key prefix.
 
 ```go
-queue, err := gobullmq.NewQueue(ctx, "myQueue",
-    gobullmq.WithRedisOptions(redisOpts),
+queueClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
+queue, err := gobullmq.NewQueue(ctx, "myQueue", queueClient,
     // Optional: Set a custom key prefix
     // gobullmq.WithKeyPrefix("myCustomPrefix"),
 )
@@ -37,7 +22,6 @@ if err != nil {
     log.Fatalf("Failed to create queue: %v", err)
 }
 ```
-
 
 ### Adding Jobs to a Queue
 
@@ -63,7 +47,6 @@ if err != nil {
 log.Printf("Added job %s with ID: %s\n", job.Name, job.Id)
 ```
 
-
 ### Pausing and Resuming a Queue
 
 The `Pause` and `Resume` methods can be used to pause and resume the queue, respectively. When a queue is paused, new jobs will not be processed until the queue is resumed.
@@ -88,7 +71,6 @@ func (q *Queue) Resume(ctx context.Context) error { // Added context
 }
 ```
 
-
 ### Checking if a Queue is Paused
 
 The `IsPaused` method can be used to check if the queue is currently paused.
@@ -101,17 +83,14 @@ func (q *Queue) IsPaused(ctx context.Context) (bool, error) { // Added context a
 }
 ```
 
-
 ### Functional Options
 
 The following functional options are available for configuring a queue:
 
-| Option                       | Description                                                                | Source                                  |
-| ---------------------------- | -------------------------------------------------------------------------- | --------------------------------------- |
-| `WithRedisOptions(*redis.Options)` | Sets the Redis connection options using a `redis.Options` struct.        |                            |
-| `WithKeyPrefix(string)`       | Sets a custom prefix for Redis keys (default is "bull").                   |                            |
-| `WithStreamsEventsMaxLen(int64)` | Sets the maximum length for the events stream (default 10000).            |                            |
-| `WithLegacyRedisConfig(ip, password, mode)` | **DEPRECATED**. Use `WithRedisOptions` instead.                               |                            |
+| Option                           | Description                                                |
+| -------------------------------- | ---------------------------------------------------------- |
+| `WithKeyPrefix(string)`          | Sets a custom prefix for Redis keys (default is "bull").   |
+| `WithStreamsEventsMaxLen(int64)` | Sets the max length for the events stream (default 10000). |
 
 ### Data Flow Diagram
 
@@ -134,26 +113,25 @@ The `Worker` component in `gobullmq` is responsible for processing jobs from the
 
 ### Creating a Worker
 
-A new worker can be created using the `NewWorker` function. This function takes the queue name, worker options, a Redis client, and a worker process function as arguments. The worker options allow you to configure the worker's behavior, such as setting the concurrency and stalled interval.
+Provide a separate Redis client for the worker to avoid `CLIENT SETNAME` collisions, and use the new processor signature with the API.
 
 ```go
-workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+workerClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
+
+workerProcess := func(ctx context.Context, job *types.Job, api gobullmq.WorkerProcessAPI) (interface{}, error) {
     fmt.Printf("Processing job: %s\n", job.Name)
-    return nil, nil
+    _ = api.UpdateProgress(ctx, job.Id, 25)
+    return "ok", nil
 }
 
 worker, err := gobullmq.NewWorker(ctx, "myQueue", gobullmq.WorkerOptions{
     Concurrency:     1,
     StalledInterval: 30000,
-}, redis.NewClient(&redis.Options{
-    Addr:     "127.0.0.1:6379",
-    Password: "",
-}), workerProcess)
+}, workerClient, workerProcess)
 if err != nil {
     log.Fatal(err)
 }
 ```
-
 
 ### Running a Worker
 
@@ -164,15 +142,14 @@ worker.Run()
 worker.Wait()
 ```
 
-
 ### Worker Options
 
 The following options are available for configuring a worker:
 
-| Option            | Description                                        | Source     |
-| ----------------- | -------------------------------------------------- | ---------- |
-| `Concurrency`     | The number of concurrent jobs the worker can process. |  |
-| `StalledInterval` | The interval for checking stalled jobs.            |  |
+| Option            | Description                                           |
+| ----------------- | ----------------------------------------------------- |
+| `Concurrency`     | The number of concurrent jobs the worker can process. |
+| `StalledInterval` | The interval for checking stalled jobs.               |
 
 ### Sequence Diagram
 
@@ -208,22 +185,18 @@ The `QueueEvents` component in `gobullmq` provides a way to listen to events emi
 
 ### Creating Queue Events
 
-Queue events can be created using the `NewQueueEvents` function. This function takes the queue name and queue events options as arguments. The queue events options allow you to configure the queue events, such as setting the Redis client and whether to automatically start listening for events.
+Use another separate Redis client for `QueueEvents` and enable `Autorun` to start consuming immediately.
 
 ```go
+eventsClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
 events, err := gobullmq.NewQueueEvents(ctx, "myQueue", gobullmq.QueueEventsOptions{
-    RedisClient: *redis.NewClient(&redis.Options{
-        Addr:     "127.0.0.1:6379",
-        Password: "",
-        DB:       0,
-    }),
-    Autorun: true,
+    RedisClient: eventsClient,
+    Autorun:     true,
 })
 if err != nil {
     log.Fatal(err)
 }
 ```
-
 
 ### Listening to Events
 
@@ -239,16 +212,11 @@ events.On("error", func(args ...interface{}) {
 })
 ```
 
-
 ### QueueEvents Options
 
 The following options are available for configuring queue events:
 
-| Option        | Description                                             | Source     |
-| ------------- | ------------------------------------------------------- | ---------- |
-| `RedisClient` | The Redis client used for connecting to the Redis server. |  |
-| `Autorun`     | Whether to automatically start listening for events.      |  |
-
-## Conclusion
-
-The `gobullmq` library provides a comprehensive set of tools for managing job queues in Golang applications. By leveraging Redis for storage and providing features such as worker processing and event handling, `gobullmq` simplifies the implementation of background tasks and distributed processing. The library's flexible configuration options and well-defined API make it a valuable asset for developers building scalable and reliable applications.
+| Option        | Description                                               |
+| ------------- | --------------------------------------------------------- |
+| `RedisClient` | The Redis client used for connecting to the Redis server. |
+| `Autorun`     | Whether to automatically start listening for events.      |

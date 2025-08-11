@@ -11,6 +11,7 @@ To begin using BullMQ for Golang, install the package using the `go get` command
 ```bash
 go get go.codycody31.dev/gobullmq
 ```
+
 This command downloads and installs the `gobullmq` package along with its dependencies.
 
 ## Basic Usage
@@ -21,33 +22,27 @@ A queue is the foundation for managing jobs. Here's how to create a new queue:
 
 ```go
 import (
-	"context"
-	"log"
+    "context"
+    "log"
 
-	"github.com/go-redis/redis/v8"
-	"go.codycody31.dev/gobullmq"
+    "github.com/redis/go-redis/v9"
+    "go.codycody31.dev/gobullmq"
 )
 
 func main() {
 	ctx := context.Background()
-	redisOpts := &redis.Options{
-		Addr: "127.0.0.1:6379", // Or your Redis server address
-		// Password: "your_password", // Uncomment if needed
-		DB: 0, // Default DB
-	}
-
-	queue, err := gobullmq.NewQueue(ctx, "myQueue",
-		gobullmq.WithRedisOptions(redisOpts),
-		// Optional: Set a custom key prefix
-		// gobullmq.WithKeyPrefix("myCustomPrefix"),
-	)
+    queueClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
+    queue, err := gobullmq.NewQueue(ctx, "myQueue", queueClient,
+        // Optional: Set a custom key prefix
+        // gobullmq.WithKeyPrefix("myCustomPrefix"),
+    )
 	if err != nil {
 		log.Fatalf("Failed to create queue: %v", err)
 	}
 }
 ```
 
-This code snippet initializes a new queue named "myQueue" and configures it to connect to a Redis server. The `WithRedisOptions` function sets the connection parameters for Redis.
+This code snippet initializes a new queue named "myQueue" using a Redis client you provide. Use functional options like `WithKeyPrefix` to customize behavior.
 
 ### Adding Jobs to the Queue
 
@@ -81,29 +76,28 @@ Workers process jobs from the queue. You need to define a worker function that w
 
 ```go
 import (
-	"context"
-	"fmt"
+    "context"
+    "fmt"
 
-	"github.com/go-redis/redis/v8"
-	"go.codycody31.dev/gobullmq"
-	"go.codycody31.dev/gobullmq/types"
+    "github.com/redis/go-redis/v9"
+    "go.codycody31.dev/gobullmq"
+    "go.codycody31.dev/gobullmq/types"
 )
 
 func main() {
 	// ... (Queue setup)
 
-	workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
-		fmt.Printf("Processing job: %s\n", job.Name)
-		return nil, nil
-	}
+    workerClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
+    workerProcess := func(ctx context.Context, job *types.Job, api gobullmq.WorkerProcessAPI) (interface{}, error) {
+        fmt.Printf("Processing job: %s\n", job.Name)
+        _ = api.UpdateProgress(ctx, job.Id, 25)
+        return "ok", nil
+    }
 
-	worker, err := gobullmq.NewWorker(ctx, "myQueue", gobullmq.WorkerOptions{
-		Concurrency:     1,
-		StalledInterval: 30000,
-	}, redis.NewClient(&redis.Options{
-		Addr:     "127.0.0.1:6379",
-		Password: "",
-	}), workerProcess)
+    worker, err := gobullmq.NewWorker(ctx, "myQueue", gobullmq.WorkerOptions{
+        Concurrency:     1,
+        StalledInterval: 30000,
+    }, workerClient, workerProcess)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -113,7 +107,7 @@ func main() {
 }
 ```
 
-In this example, `workerProcess` is the function that processes each job.  The `NewWorker` function creates a worker that processes jobs from "myQueue" with a concurrency of 1 and a stalled interval of 30000 milliseconds. The `Run` method starts the worker, and `Wait` blocks until the worker is finished.
+In this example, `workerProcess` is the function that processes each job. The `NewWorker` function creates a worker that processes jobs from "myQueue" with a concurrency of 1 and a stalled interval of 30000 milliseconds. The `Run` method starts the worker, and `Wait` blocks until the worker is finished.
 
 ### Listening for Queue Events
 
@@ -121,24 +115,21 @@ Queue events allow you to monitor the lifecycle of jobs in the queue.
 
 ```go
 import (
-	"context"
-	"fmt"
+    "context"
+    "fmt"
 
-	"github.com/go-redis/redis/v8"
-	"go.codycody31.dev/gobullmq"
+    "github.com/redis/go-redis/v9"
+    "go.codycody31.dev/gobullmq"
 )
 
 func main() {
 	// ... (Queue setup)
 
-	events, err := gobullmq.NewQueueEvents(ctx, "myQueue", gobullmq.QueueEventsOptions{
-		RedisClient: *redis.NewClient(&redis.Options{
-			Addr:     "127.0.0.1:6379",
-			Password: "",
-			DB:       0,
-		}),
-		Autorun: true,
-	})
+    eventsClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
+    events, err := gobullmq.NewQueueEvents(ctx, "myQueue", gobullmq.QueueEventsOptions{
+        RedisClient: eventsClient,
+        Autorun:     true,
+    })
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -153,7 +144,7 @@ func main() {
 }
 ```
 
-This code creates a new `QueueEvents` instance that listens for events on the "myQueue" queue.  The `On` method registers event listeners for "added" and "error" events.
+This code creates a new `QueueEvents` instance that listens for events on the "myQueue" queue. The `On` method registers event listeners for "added" and "error" events.
 
 ## Configuration Options
 
@@ -161,25 +152,24 @@ Configuration is primarily managed using functional options passed to `NewQueue`
 
 ### Queue Functional Options
 
-| Option                      | Type             | Description                                                              | Default Value | Source File(s) |
-| --------------------------- | ---------------- | ------------------------------------------------------------------------ | ------------- | ---------------- |
-| `WithRedisOptions`          | `*redis.Options` | Sets the Redis connection options.                                      | N/A           |     |
-| `WithKeyPrefix`             | `string`         | Sets a custom prefix for Redis keys.                                    | `"bull"`      |     |
-| `WithStreamsEventsMaxLen`   | `int64`          | Sets the maximum length for the events stream.                          | `10000`       |     |
+| Option                    | Type     | Description                                    | Default Value |
+| ------------------------- | -------- | ---------------------------------------------- | ------------- |
+| `WithKeyPrefix`           | `string` | Sets a custom prefix for Redis keys.           | `"bull"`      |
+| `WithStreamsEventsMaxLen` | `int64`  | Sets the maximum length for the events stream. | `10000`       |
 
 ### Worker Options
 
-| Option            | Type    | Description                                               | Source File(s) |
-| ----------------- | ------- | --------------------------------------------------------- | ---------------- |
-| `Concurrency`       | `int`   | The number of concurrent jobs the worker can process.     |     |
-| `StalledInterval` | `int`   | The interval for checking stalled jobs (milliseconds). |     |
+| Option            | Type  | Description                                            |
+| ----------------- | ----- | ------------------------------------------------------ |
+| `Concurrency`     | `int` | The number of concurrent jobs the worker can process.  |
+| `StalledInterval` | `int` | The interval for checking stalled jobs (milliseconds). |
 
 ### QueueEvents Options
 
-| Option        | Type           | Description                                         | Source File(s) |
-| ------------- | -------------- | --------------------------------------------------- | ---------------- |
-| `RedisClient` | `redis.Client` | The Redis client used for connecting to the server. |     |
-| `Autorun`     | `bool`         | Whether to automatically start listening for events.  |     |
+| Option        | Type           | Description                                          |
+| ------------- | -------------- | ---------------------------------------------------- |
+| `RedisClient` | `redis.Client` | The Redis client used for connecting to the server.  |
+| `Autorun`     | `bool`         | Whether to automatically start listening for events. |
 
 ## Advanced Job Management
 
@@ -197,12 +187,18 @@ import (
 
 func main() {
     ctx := context.Background()
-    redisOpts := &redis.Options{
-        Addr: "127.0.0.1:6379",
-    }
-    queue, err := gobullmq.NewQueue(ctx, "myQueue",
-        gobullmq.WithRedisOptions(redisOpts),
-    )
+	
+	// Define Redis connection options
+	redisOpts := &redis.Options{
+		Addr: "127.0.0.1:6379",
+		// Password: "", // Add password if needed
+		DB: 0, // Default DB
+	}
+
+	// Create separate redis clients for queue, worker, and events to avoid CLIENT SETNAME clashes
+	queueClient := redis.NewClient(redisOpts)
+
+    queue, err := gobullmq.NewQueue(ctx, "myQueue", queueClient)
     if err != nil {
         log.Fatal(err)
     }
@@ -227,11 +223,11 @@ This code snippet adds a job that repeats every 10 seconds. The `AddWithRepeat` 
 
 You can configure job behavior using functional options when adding a job:
 
-*   `AddWithPriority(int)`: Sets the priority of the job.
-*   `AddWithDelay(int)`: Sets the delay (in milliseconds) before the job is processed.
-*   `AddWithAttempts(int)`: Sets the number of attempts for the job.
-*   `AddWithRemoveOnComplete(gobullmq.KeepJobs{Count: 100})`: Keep last 100 completed jobs.
-*   `AddWithRepeat(types.JobRepeatOptions)`: Configures the job to repeat based on the provided options.
+- `AddWithPriority(int)`: Sets the priority of the job.
+- `AddWithDelay(int)`: Sets the delay (in milliseconds) before the job is processed.
+- `AddWithAttempts(int)`: Sets the number of attempts for the job.
+- `AddWithRemoveOnComplete(gobullmq.KeepJobs{Count: 100})`: Keep last 100 completed jobs.
+- `AddWithRepeat(types.JobRepeatOptions)`: Configures the job to repeat based on the provided options.
 
 ### Job Structure
 
@@ -303,26 +299,3 @@ func (q *Queue) Resume(ctx context.Context) error { // Added context
 	return nil
 }
 ```
-
-## Architecture Overview
-
-```mermaid
-graph TD
-    A[Queue] --> B(Add Job);
-    B --> C{Redis};
-    C --> D[Worker];
-    D --> E{Process Job};
-    E --> F(Complete/Fail);
-    F --> C;
-    C --> G[Queue Events];
-    G --> H((Listeners));
-    style A fill:#f9f,stroke:#333,stroke-width:2px
-    style D fill:#ccf,stroke:#333,stroke-width:2px
-    style C fill:#ccf,stroke:#333,stroke-width:2px
-```
-
-This diagram illustrates the basic flow of jobs through the BullMQ system. Jobs are added to the queue, stored in Redis, processed by workers, and then marked as complete or failed. Queue events allow listeners to monitor the progress of jobs.
-
-## Conclusion
-
-This guide provides a basic overview of how to get started with BullMQ for Golang. By following these steps, you can set up a job queue, add jobs, process them with workers, and monitor their progress using queue events. BullMQ provides a robust and flexible solution for managing background jobs in your Go applications.

@@ -6,13 +6,15 @@ Workers are initialized with specific concurrency settings and a processing func
 
 ## Worker Initialization and Configuration
 
-A worker is initialized using the `NewWorker` function, which requires a context, queue name, `WorkerOptions`, a Redis client, and a worker process function. The `WorkerOptions` struct allows configuration of concurrency and stalled job intervals.
+A worker is initialized using the `NewWorker` function, which requires a context, queue name, `WorkerOptions`, a Redis client, and a worker process function. The `WorkerOptions` struct allows configuration of concurrency, stalled job intervals, and retry backoff.
 
 ```go
+workerClient := redis.NewClient(redisOpts)
 worker, err := gobullmq.NewWorker(ctx, queueName, gobullmq.WorkerOptions{
     Concurrency:     1,
     StalledInterval: 30000,
-}, redis.NewClient(redisOpts), workerProcess)
+    Backoff:         &gobullmq.BackoffOptions{Type: "exponential", Delay: 500},
+}, workerClient, workerProcess)
 if err != nil {
     fmt.Println("Error initializing worker:", err)
     return
@@ -30,20 +32,14 @@ The `WorkerOptions` struct configures the behavior of the worker.
 
 ### Worker Process Function
 
-The worker process function is a callback that defines the logic to be executed for each job. It receives a context and a `Job` struct as input and returns an interface and an error.
+The worker process function defines the logic for each job. It receives a context, the `Job`, and an `api` exposing helpers for updating progress, updating data, and extending the lock.
 
 ```go
-workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+workerProcess := func(ctx context.Context, job *types.Job, api gobullmq.WorkerProcessAPI) (interface{}, error) {
     fmt.Printf("Processing job: %s\n", job.Id)
-    fmt.Printf("Data: %v\n", job.Data)
-
-    if job.RepeatJobKey != "" {
-        fmt.Printf("Repeat job key: %s\n", job.RepeatJobKey)
-    }
-
-    // time.Sleep(5 * time.Second)
-    // return nil, errors.New("job failed")
-    return nil, nil
+    _ = api.UpdateProgress(ctx, job.Id, 10)
+    _ = api.ExtendLock(ctx, job)
+    return "ok", nil
 }
 ```
 
@@ -105,29 +101,7 @@ The `moveToFailedArgs` function prepares the arguments for the Lua script that m
 
 ## Stalled Job Detection
 
-Workers periodically check for stalled jobs. A stalled job is one that was being processed by a worker that crashed or failed to update the job's status. The `StalledInterval` option in `WorkerOptions` determines how often the worker checks for stalled jobs. The Lua script `moveStalledJobsToWait_lua.go` is used to move stalled jobs back to the wait queue.
-
-```lua
---[[
-  Moves stalled jobs from "active" to "wait" queue.
-  This script iterates over the "active" queue, checks for jobs that have been
-  active for longer than the "maxStalledCount" time, and moves them back to the
-  "wait" queue.
-    Keys:
-      activeQ  The queue's 'active' list (LIST)
-      waitQ  The queue's 'wait' list (LIST)
-      stalledQ  The queue's 'stalled' set (SET)
-      queueMetaKey  The queue's metadata key (HASH)
-      eventStreamKey  The queue's event stream (STREAM)
-      maxStalledJobCount  Max stalled job count
-      queueKeyPrefix  queue.toKey('')
-      timestamp  timestamp
-      maxCheckTime  max check time
-    Events:
-      'stalled' with stalled job id.
-]]
-local rcall = redis.call
-```
+Workers periodically check for stalled jobs. A stalled job is one that was being processed by a worker that crashed or failed to update the job's status. The `StalledInterval` option in `WorkerOptions` determines how often the worker checks for stalled jobs.
 
 ## Worker Events
 
@@ -138,7 +112,3 @@ worker.On("error", func(args ...interface{}) {
     fmt.Println("Worker error:", args)
 })
 ```
-
-## Conclusion
-
-Worker processing is a crucial part of the `gobullmq` library, providing a reliable and efficient way to process jobs from a queue. Workers are configurable, handle job completion and failure, and detect stalled jobs. The event system allows for monitoring and logging of job lifecycle events.

@@ -10,14 +10,12 @@ The `Queue` can be customized during its creation using functional options. Thes
 
 The `NewQueue` function accepts functional options to configure the queue's behavior. . These options are applied when the `Queue` is initialized.
 
-*   **`WithRedisOptions(*redis.Options)`**: Sets the Redis connection options. This is the recommended way to configure the Redis connection.
 *   **`WithKeyPrefix(string)`**: Sets a custom prefix for Redis keys. The default prefix is "bull".
 
 ### Example
 
 ```go
-queue, err := gobullmq.NewQueue(ctx, "myQueue",
-    gobullmq.WithRedisOptions(redisOpts),
+queue, err := gobullmq.NewQueue(ctx, "myQueue", queueClient,
     gobullmq.WithKeyPrefix("myCustomPrefix"),
 )
 ```
@@ -171,6 +169,3 @@ events, err := gobullmq.NewQueueEvents(ctx, "myQueue", gobullmq.QueueEventsOptio
 
 This code snippet demonstrates how to create new queue events with custom Redis client and autorun settings.
 
-## Conclusion
-
-Customization in this project's job queue system is achieved through a combination of functional options and configuration structs. These mechanisms enable developers to tailor the behavior of queues, jobs, workers, and queue events to suit the specific needs of their applications. By leveraging these customization options, developers can optimize the performance, reliability, and flexibility of their job processing pipelines.
