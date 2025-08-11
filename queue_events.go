@@ -6,11 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
-	eventemitter "go.codycody31.dev/gobullmq/internal/eventEmitter"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	eventemitter "go.codycody31.dev/gobullmq/internal/eventEmitter"
 )
 
 // QueueEventsIface is an interface for the QueueEvents struct and defines the methods that can be used to interact with the queue events

@@ -1,3 +1,4 @@
+
 # BullMQ for Golang
 
 BullMQ for Golang is a powerful and flexible job queue library that allows you to manage and process jobs using Redis. It provides a robust set of features for creating, processing, and managing jobs in a distributed environment.
@@ -29,7 +30,7 @@ import (
 	"context"
 	"log"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"go.codycody31.dev/gobullmq"
 	"go.codycody31.dev/gobullmq/types"
 )
@@ -96,6 +97,74 @@ if err != nil {
 
 worker.Run()
 worker.Wait()
+```
+
+### worker in cluster mode 
+```go
+func main() {
+	ctx := context.Background()
+	queueName := "jobQueue"
+
+	// Create Redis Cluster client options
+	rdb := redis.NewClusterClient(&redis.ClusterOptions{
+		Addrs: []string{
+			"127.0.0.1:7000",
+			"127.0.0.1:7001",
+			"127.0.0.1:7002",
+		},
+	})
+
+	_, err := rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Failed to connect to Redis Cluster: %v", err)
+	}
+	fmt.Println("Connected to Redis Cluster")
+
+	// Define the worker process function
+	workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+		fmt.Printf("job.Data type: %T, value: %v\n", job.Data, job.Data)
+
+		return nil, nil
+	}
+
+	// Initialize the worker with Redis cluster connection
+	worker, err := gobullmq.NewWorker(ctx, queueName, gobullmq.WorkerOptions{
+		Concurrency:     10,
+		StalledInterval: 30000,
+		Prefix:          "{jobQueue}",
+	}, rdb, workerProcess)
+	if err != nil {
+		log.Fatalf("Failed to create worker: %v", err)
+	}
+
+	fmt.Println("Starting gobullmq worker with concurrency 10...")
+	fmt.Println("Waiting for 'job' tasks in queue 'jobQueue'...")
+
+	// Set up error handling
+	worker.On("error", func(args ...interface{}) {
+		fmt.Printf("Worker error: %v\n", args)
+	})
+
+	// Handle graceful shutdown
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+
+	// Run the worker in a goroutine
+	
+		if err := worker.Run(); err != nil {
+			log.Printf("Worker error: %v", err)
+		}
+
+
+	// Wait for interrupt signal
+	<-c
+
+	fmt.Println("\nShutting down worker...")
+	worker.Close()
+	rdb.Close()
+	fmt.Println("Worker shut down gracefully")
+}
+
 ```
 
 ### QueueEvents

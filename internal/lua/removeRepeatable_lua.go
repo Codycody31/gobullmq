@@ -5,7 +5,8 @@ package lua
 import (
 	"context"
 	"fmt"
-	"github.com/go-redis/redis/v8"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // RemoveRepeatable executes the Lua script removeRepeatable on Redis with 2 keys.

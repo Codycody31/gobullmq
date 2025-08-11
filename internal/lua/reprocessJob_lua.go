@@ -5,7 +5,8 @@ package lua
 import (
 	"context"
 	"fmt"
-	"github.com/go-redis/redis/v8"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // ReprocessJob executes the Lua script reprocessJob on Redis with 6 keys.

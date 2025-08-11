@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
 	eventemitter "go.codycody31.dev/gobullmq/internal/eventEmitter"
 	"go.codycody31.dev/gobullmq/internal/fifoqueue"
@@ -122,10 +122,16 @@ type NextJobData struct {
 
 // NewWorker creates a new Worker instance
 func NewWorker(ctx context.Context, name string, opts WorkerOptions, connection redis.Cmdable, processor WorkerProcessFunc) (*Worker, error) {
+	// Derive cancellable context for worker lifetime
 	ctx, cancel := context.WithCancel(ctx)
 
-	// TODO: Have default opts, then merge in the provided opts and allow the provided opts to override the default opts
+	// Validate required options early
+	if opts.StalledInterval <= 0 {
+		cancel()
+		return nil, errors.New("stalledInterval must be greater than 0")
+	}
 
+	// Initialize Worker struct with defaults and provided parameters
 	w := &Worker{
 		Name:        name,
 		Token:       uuid.New(),
@@ -140,12 +146,12 @@ func NewWorker(ctx context.Context, name string, opts WorkerOptions, connection 
 		blockUntil:  0,
 		limitUntil:  0,
 		drained:     false,
+		jobsInProgress: &jobsInProgress{
+			jobs: make(map[string]jobInProgress),
+		},
 	}
 
-	w.jobsInProgress = &jobsInProgress{
-		jobs: make(map[string]jobInProgress),
-	}
-
+	// Setup key prefix with fallback
 	if opts.Prefix == "" {
 		w.KeyPrefix = "bull"
 	} else {
@@ -154,22 +160,37 @@ func NewWorker(ctx context.Context, name string, opts WorkerOptions, connection 
 	w.Prefix = w.KeyPrefix
 	w.KeyPrefix = w.KeyPrefix + ":" + name + ":"
 
-	if w.opts.StalledInterval <= 0 {
-		return nil, errors.New("stalledInterval must be greater than 0")
+	// Set redis client name on the connection(s)
+	switch c := connection.(type) {
+	case *redis.Client:
+		if err := c.Do(ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s", w.Prefix, base64.StdEncoding.EncodeToString([]byte(w.Name)))).Err(); err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to set redis client name: %w", err)
+		}
+	case *redis.ClusterClient:
+		err := c.ForEachShard(ctx, func(ctx context.Context, shardClient *redis.Client) error {
+			if err := shardClient.Do(ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s", w.Prefix, base64.StdEncoding.EncodeToString([]byte(w.Name)))).Err(); err != nil {
+				return fmt.Errorf("failed to set redis client name on shard: %w", err)
+			}
+			return nil
+		})
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("failed to set redis client name on cluster shards: %w", err)
+		}
+	default:
+		cancel()
+		return nil, fmt.Errorf("unsupported redis client type %T", connection)
 	}
 
-	client, ok := w.redisClient.(*redis.Client)
-	if !ok {
-		return nil, errors.New("redis client is not a *redis.Client")
-	}
-	client.Do(w.ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s", w.Prefix, base64.StdEncoding.EncodeToString([]byte(w.Name))))
-
+	// Initialize scripts helper with same Redis client, context and prefix
 	w.scripts = newScripts(w.redisClient, w.ctx, w.KeyPrefix)
 
+	// If autorun option enabled, start the worker immediately
 	if opts.Autorun {
-		err := w.Run()
-		if err != nil {
-			return nil, fmt.Errorf("error running worker: %v", err)
+		if err := w.Run(); err != nil {
+			cancel()
+			return nil, fmt.Errorf("error running worker: %w", err)
 		}
 	}
 

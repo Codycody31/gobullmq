@@ -5,7 +5,8 @@ package lua
 import (
 	"context"
 	"fmt"
-	"github.com/go-redis/redis/v8"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Drain executes the Lua script drain on Redis with 4 keys.

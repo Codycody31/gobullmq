@@ -5,7 +5,8 @@ package lua
 import (
 	"context"
 	"fmt"
-	"github.com/go-redis/redis/v8"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // ChangePriority executes the Lua script changePriority on Redis with 5 keys.

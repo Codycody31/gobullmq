@@ -5,7 +5,8 @@ package lua
 import (
 	"context"
 	"fmt"
-	"github.com/go-redis/redis/v8"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // MoveToDelayed executes the Lua script moveToDelayed on Redis with 8 keys.
