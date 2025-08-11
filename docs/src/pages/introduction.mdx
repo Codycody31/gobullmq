@@ -1,0 +1,254 @@
+## Introduction
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [README.md](README.md)
+- [examples/example/main.go](examples/example/main.go)
+- [job.go](job.go)
+- [queue.go](queue.go)
+- [scripts.go](scripts.go)
+- [internal/lua/addJob_lua.go](internal/lua/addJob_lua.go)
+</details>
+
+# Introduction
+
+The `gobullmq` library provides a robust job queue system for Golang, leveraging Redis for managing and processing jobs. It offers features for creating queues, defining workers to process jobs concurrently, handling events during the job lifecycle, and scheduling repeatable jobs. The library aims to simplify the implementation of background tasks and distributed processing in Go applications.
+
+This documentation provides an overview of the key components and functionalities of the `gobullmq` library, including queues, workers, and event handling. It details how to configure and use these components to effectively manage job processing in your applications. It also provides code snippets to help guide you.
+
+## Queue Management
+
+The `Queue` component in `gobullmq` is responsible for managing the job queue. It provides methods for adding jobs to the queue, pausing and resuming the queue, and checking the queue's paused state. The queue uses Redis to store job data and manage the queue's state.
+
+### Creating a Queue
+
+A new queue can be created using the `NewQueue` function. This function takes the queue name and a set of functional options as arguments. The functional options allow you to configure the queue's behavior, such as setting the Redis connection options and key prefix.
+
+```go
+queue, err := gobullmq.NewQueue(ctx, "myQueue",
+    gobullmq.WithRedisOptions(redisOpts),
+    // Optional: Set a custom key prefix
+    // gobullmq.WithKeyPrefix("myCustomPrefix"),
+)
+if err != nil {
+    log.Fatalf("Failed to create queue: %v", err)
+}
+```
+
+
+### Adding Jobs to a Queue
+
+Jobs can be added to the queue using the `Add` method. This method takes the job name, job data, and a set of functional options as arguments. The job data can be any struct that can be serialized to JSON. The functional options allow you to configure the job's behavior, such as setting the job's priority and delay.
+
+```go
+jobData := struct {
+    Message string
+    Count   int
+}{
+    Message: "Hello BullMQ!",
+    Count:   1,
+}
+
+// Add a job using functional options
+job, err := queue.Add(ctx, "myJob", jobData,
+    gobullmq.AddWithPriority(5),
+    gobullmq.AddWithDelay(2000), // Delay by 2 seconds
+)
+if err != nil {
+    log.Fatalf("Failed to add job: %v", err)
+}
+log.Printf("Added job %s with ID: %s\n", job.Name, job.Id)
+```
+
+
+### Pausing and Resuming a Queue
+
+The `Pause` and `Resume` methods can be used to pause and resume the queue, respectively. When a queue is paused, new jobs will not be processed until the queue is resumed.
+
+```go
+// Pause pauses the queue, preventing new jobs from being processed.
+func (q *Queue) Pause(ctx context.Context) error { // Added context
+	if err := q.pause(ctx, true); err != nil {
+		return fmt.Errorf("failed to pause queue: %w", err)
+	}
+	q.Emit("paused")
+	return nil
+}
+
+// Resume resumes the queue, allowing jobs to be processed.
+func (q *Queue) Resume(ctx context.Context) error { // Added context
+	if err := q.pause(ctx, false); err != nil {
+		return fmt.Errorf("failed to resume queue: %w", err)
+	}
+	q.Emit("resumed")
+	return nil
+}
+```
+
+
+### Checking if a Queue is Paused
+
+The `IsPaused` method can be used to check if the queue is currently paused.
+
+```go
+// IsPaused checks if the queue is currently paused.
+func (q *Queue) IsPaused(ctx context.Context) (bool, error) { // Added context and error return
+	pausedKeyExists, err := q.Client.HExists(ctx, q.KeyPrefix+"meta", "paused").Result()
+	return pausedKeyExists, err
+}
+```
+
+
+### Functional Options
+
+The following functional options are available for configuring a queue:
+
+| Option                       | Description                                                                | Source                                  |
+| ---------------------------- | -------------------------------------------------------------------------- | --------------------------------------- |
+| `WithRedisOptions(*redis.Options)` | Sets the Redis connection options using a `redis.Options` struct.        |                            |
+| `WithKeyPrefix(string)`       | Sets a custom prefix for Redis keys (default is "bull").                   |                            |
+| `WithStreamsEventsMaxLen(int64)` | Sets the maximum length for the events stream (default 10000).            |                            |
+| `WithLegacyRedisConfig(ip, password, mode)` | **DEPRECATED**. Use `WithRedisOptions` instead.                               |                            |
+
+### Data Flow Diagram
+
+```mermaid
+graph TD
+    A[Client Application] --> B(Queue.Add);
+    B --> C{Redis};
+    C --> D(Queue:wait);
+    C --> E(Queue:meta);
+    C --> F(Queue:id);
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style C fill:#ccf,stroke:#333,stroke-width:2px
+```
+
+This diagram illustrates the data flow when adding a job to the queue. The client application calls the `Add` method on the `Queue` object, which then stores the job data in Redis. The job is added to the `wait` queue, and metadata and ID information are also stored in Redis.
+
+## Worker Processing
+
+The `Worker` component in `gobullmq` is responsible for processing jobs from the queue. It provides methods for defining a worker process function, running the worker, and waiting for the worker to complete. The worker uses Redis to retrieve job data and update the job's state.
+
+### Creating a Worker
+
+A new worker can be created using the `NewWorker` function. This function takes the queue name, worker options, a Redis client, and a worker process function as arguments. The worker options allow you to configure the worker's behavior, such as setting the concurrency and stalled interval.
+
+```go
+workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+    fmt.Printf("Processing job: %s\n", job.Name)
+    return nil, nil
+}
+
+worker, err := gobullmq.NewWorker(ctx, "myQueue", gobullmq.WorkerOptions{
+    Concurrency:     1,
+    StalledInterval: 30000,
+}, redis.NewClient(&redis.Options{
+    Addr:     "127.0.0.1:6379",
+    Password: "",
+}), workerProcess)
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+
+### Running a Worker
+
+The `Run` method starts the worker, which begins processing jobs from the queue. The `Wait` method blocks until the worker has completed all of its tasks.
+
+```go
+worker.Run()
+worker.Wait()
+```
+
+
+### Worker Options
+
+The following options are available for configuring a worker:
+
+| Option            | Description                                        | Source     |
+| ----------------- | -------------------------------------------------- | ---------- |
+| `Concurrency`     | The number of concurrent jobs the worker can process. |  |
+| `StalledInterval` | The interval for checking stalled jobs.            |  |
+
+### Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Redis
+    participant Worker
+
+    Client->>Redis: Add Job
+    activate Redis
+    Redis-->>Client: OK
+    deactivate Redis
+
+    Worker->>Redis: Check for Jobs
+    activate Redis
+    Redis-->>Worker: Job Data
+    deactivate Redis
+    activate Worker
+    Worker->>Worker: Process Job
+    Worker->>Redis: Update Job Status
+    activate Redis
+    Redis-->>Worker: OK
+    deactivate Redis
+    deactivate Worker
+```
+
+This diagram illustrates the sequence of events when a worker processes a job. The client adds a job to Redis, and the worker periodically checks Redis for new jobs. When a job is found, the worker processes the job and updates the job's status in Redis.
+
+## Queue Events
+
+The `QueueEvents` component in `gobullmq` provides a way to listen to events emitted by the queue. These events can be used to monitor the queue's state and take action when certain events occur, such as when a job is added, completed, or fails.
+
+### Creating Queue Events
+
+Queue events can be created using the `NewQueueEvents` function. This function takes the queue name and queue events options as arguments. The queue events options allow you to configure the queue events, such as setting the Redis client and whether to automatically start listening for events.
+
+```go
+events, err := gobullmq.NewQueueEvents(ctx, "myQueue", gobullmq.QueueEventsOptions{
+    RedisClient: *redis.NewClient(&redis.Options{
+        Addr:     "127.0.0.1:6379",
+        Password: "",
+        DB:       0,
+    }),
+    Autorun: true,
+})
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+
+### Listening to Events
+
+The `On` method can be used to register event listeners for specific events. The event listener function will be called when the event is emitted by the queue.
+
+```go
+events.On("added", func(args ...interface{}) {
+    fmt.Println("Job added:", args)
+})
+
+events.On("error", func(args ...interface{}) {
+    fmt.Println("Error event:", args)
+})
+```
+
+
+### QueueEvents Options
+
+The following options are available for configuring queue events:
+
+| Option        | Description                                             | Source     |
+| ------------- | ------------------------------------------------------- | ---------- |
+| `RedisClient` | The Redis client used for connecting to the Redis server. |  |
+| `Autorun`     | Whether to automatically start listening for events.      |  |
+
+## Conclusion
+
+The `gobullmq` library provides a comprehensive set of tools for managing job queues in Golang applications. By leveraging Redis for storage and providing features such as worker processing and event handling, `gobullmq` simplifies the implementation of background tasks and distributed processing. The library's flexible configuration options and well-defined API make it a valuable asset for developers building scalable and reliable applications.

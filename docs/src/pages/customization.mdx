@@ -1,0 +1,176 @@
+# Customization
+
+This page provides a comprehensive overview of the customization options available when working with job queues in this project. Customization is primarily achieved through functional options when creating queues, workers, and queue events, as well as through options provided when adding jobs to the queue. These options allow developers to tailor the behavior of the queue system to meet specific application requirements. This page will cover the various customization options available, how they are used, and their impact on the queue's behavior.
+
+## Queue Customization
+
+The `Queue` can be customized during its creation using functional options. These options modify the `Queue`'s configuration.
+
+### Functional Options
+
+The `NewQueue` function accepts functional options to configure the queue's behavior. . These options are applied when the `Queue` is initialized.
+
+*   **`WithRedisOptions(*redis.Options)`**: Sets the Redis connection options. This is the recommended way to configure the Redis connection.
+*   **`WithKeyPrefix(string)`**: Sets a custom prefix for Redis keys. The default prefix is "bull".
+
+### Example
+
+```go
+queue, err := gobullmq.NewQueue(ctx, "myQueue",
+    gobullmq.WithRedisOptions(redisOpts),
+    gobullmq.WithKeyPrefix("myCustomPrefix"),
+)
+```
+
+This code snippet demonstrates how to create a new queue with custom Redis options and a custom key prefix.
+
+## Job Customization
+
+Jobs can be customized when they are added to the queue using functional options with the `Add` method.
+
+### Add Options
+
+The `Add` method in the `Queue` struct accepts functional options that allow you to configure individual jobs. These options are defined as `AddOption` type.
+
+*   **`AddWithPriority(priority int)`**: Sets the priority for the job. Lower numbers indicate higher priority.
+*   **`AddWithRemoveOnComplete(keep ...types.KeepJobs)`**: Configures job removal upon successful completion. If `keep` is provided, it specifies the number/age criteria. If `keep` is omitted, it defaults to removing the job immediately.
+*   **`AddWithRemoveOnFail(keep ...types.KeepJobs)`**: Configures job removal upon failure. If `keep` is provided, it specifies the number/age criteria. If `keep` is omitted, it defaults to keeping the job.
+*   **`AddWithAttempts(times int)`**: Sets the maximum number of attempts for the job.
+*   **`AddWithDelay(delayMillis int)`**: Sets an initial delay (in milliseconds) before the job can be processed.
+*   **`AddWithTimestamp(tsMillis int64)`**: Sets a custom timestamp for the job. Defaults to `time.Now().UnixMilli()` if not set.
+*   **`AddWithJobID(id string)`**: Sets a specific ID for the job. Use with caution, as IDs must be unique.
+*   **`AddWithRepeat(repeatOpts types.JobRepeatOptions)`**: Configures the job to repeat based on the provided options.
+*   **`AddWithLifo()`**: Adds the job using LIFO (Last In, First Out) order.
+*   **`AddWithFailParentOnFailure(fail bool)`**: Marks the job to fail its parent job if this job fails.
+*   **`AddWithParent(parentOpts types.ParentOpts)`**: Sets the parent job information for this job.
+*   **`AddWithRemoveDependencyOnFailure(remove bool)`**: Marks the job's dependency to be removed from its parent even if this job fails.
+
+### Example
+
+```go
+jobData := map[string]string{"task": "send_email", "to": "user@example.com"}
+
+job, err := queue.Add(ctx, "emailJob", jobData,
+    gobullmq.AddWithPriority(2),
+    gobullmq.AddWithDelay(5000), // Delay 5 seconds
+    gobullmq.AddWithAttempts(3),
+    gobullmq.AddWithRemoveOnComplete(gobullmq.KeepJobs{Count: 100}), // Keep last 100 completed
+)
+```
+
+This code snippet demonstrates how to add a job to the queue with various options such as priority, delay, attempts, and remove on complete settings.
+
+### Job Options Data Structure
+
+The `JobOptions` struct in `types/job.go` defines the available options for a job.
+
+```go
+type JobOptions struct {
+	Priority              int              `json:"priority"`
+	Attempts              int              `json:"attempts"`
+	Delay                 int              `json:"delay"`
+	TimeStamp             int64            `json:"timestamp"`
+	Lifo                  bool             `json:"lifo"`
+	JobId                 string           `json:"jobId"`
+	RepeatJobKey          string           `json:"repeatJobKey"`
+	Token                 string           `json:"token"`
+	FailParentOnFailure   bool             `json:"failParentOnFailure"`
+	RemoveDependencyOnFailure bool			 `json:"rdof"`
+	RemoveOnComplete      *KeepJobs        `json:"removeOnComplete"`
+	RemoveOnFail          *KeepJobs        `json:"removeOnFail"`
+	Repeat                *JobRepeatOptions `json:"repeat"`
+	Parent                 *ParentOpts      `json:"parent"`
+}
+```
+
+This struct contains fields for configuring various aspects of a job, such as priority, attempts, delay, and removal policies.
+
+### KeepJobs Data Structure
+
+The `KeepJobs` struct allows to configure the retention policy for jobs, based on either the number of jobs to keep or the maximum age of the jobs.
+
+```go
+type KeepJobs struct {
+	Age   int `json:"age"`
+	Count int `json:"count"`
+}
+```
+
+
+
+### Job Repeat Options
+
+The `JobRepeatOptions` struct is used to configure repeatable jobs.
+
+```go
+type JobRepeatOptions struct {
+	Cron          string `json:"cron"`
+	Every         int    `json:"every"`
+	Limit         int    `json:"limit"`
+	PrevMillis    int    `json:"prevMillis"`
+	Count 		  int 	 `json:"count"`
+	JobId 		  string `json:"jobId"`
+}
+```
+
+
+
+## Worker Customization
+
+Workers can be customized during their creation using `WorkerOptions`.
+
+### Worker Options
+
+The `NewWorker` function accepts `WorkerOptions` to configure the worker's behavior.
+
+*   **`Concurrency`**: The number of concurrent jobs the worker can process.
+*   **`StalledInterval`**: The interval for checking stalled jobs.
+
+### Example
+
+```go
+workerProcess := func(ctx context.Context, job *types.Job) (interface{}, error) {
+    fmt.Printf("Processing job: %s\n", job.Name)
+    return nil, nil
+}
+
+worker, err := gobullmq.NewWorker(ctx, "myQueue", gobullmq.WorkerOptions{
+    Concurrency:     1,
+    StalledInterval: 30000,
+}, redis.NewClient(&redis.Options{
+    Addr:     "127.0.0.1:6379",
+    Password: "",
+}), workerProcess)
+```
+
+This code snippet demonstrates how to create a new worker with custom concurrency and stalled interval settings.
+
+## Queue Events Customization
+
+Queue events can be customized during their creation using `QueueEventsOptions`.
+
+### Queue Events Options
+
+The `NewQueueEvents` function accepts `QueueEventsOptions` to configure the queue events' behavior.
+
+*   **`RedisClient`**: The Redis client used for connecting to the Redis server.
+*   **`Autorun`**: Whether to automatically start listening for events.
+
+### Example
+
+```go
+events, err := gobullmq.NewQueueEvents(ctx, "myQueue", gobullmq.QueueEventsOptions{
+    RedisClient: *redis.NewClient(&redis.Options{
+        Addr:     "127.0.0.1:6379",
+        Password: "",
+        DB:       0,
+    }),
+    Autorun: true,
+})
+```
+
+This code snippet demonstrates how to create new queue events with custom Redis client and autorun settings.
+
+## Conclusion
+
+Customization in this project's job queue system is achieved through a combination of functional options and configuration structs. These mechanisms enable developers to tailor the behavior of queues, jobs, workers, and queue events to suit the specific needs of their applications. By leveraging these customization options, developers can optimize the performance, reliability, and flexibility of their job processing pipelines.
