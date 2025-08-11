@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/redis/go-redis/v9"
 	"go.codycody31.dev/gobullmq"
 	"go.codycody31.dev/gobullmq/types"
 )
@@ -47,7 +47,7 @@ func main() {
 	worker, err := gobullmq.NewWorker(ctx, queueName, gobullmq.WorkerOptions{
 		Concurrency:     1,
 		StalledInterval: 30000,
-	}, redis.NewClient(redisOpts), workerProcess, false)
+	}, redis.NewClient(redisOpts), workerProcess)
 	if err != nil {
 		fmt.Println("Error initializing worker:", err)
 		return

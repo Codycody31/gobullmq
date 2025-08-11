@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	cr "github.com/robfig/cron/v3"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.codycody31.dev/gobullmq/internal/utils"
@@ -158,7 +158,7 @@ func NewQueue(ctx context.Context, name string, functionalOpts ...QueueFunctiona
 	}
 
 	// Set stream max length
-	if _, err := q.Client.XTrim(q.ctx, q.toKey("events"), opts.StreamsEventsMaxLen).Result(); err != nil {
+	if _, err := q.Client.XTrimMaxLen(q.ctx, q.toKey("events"), opts.StreamsEventsMaxLen).Result(); err != nil {
 		// Log error but don't fail queue creation? Or should this be fatal?
 		q.Emit("error", fmt.Sprintf("Failed to set initial trim for events stream: %v", err))
 	}
@@ -491,7 +491,7 @@ func (q *Queue) scheduleNextRepeatableJob(ctx context.Context, name string, json
 	// ---------------
 
 	// Update the repeat set in Redis
-	_, err = q.Client.ZAdd(ctx, q.toKey("repeat"), &redis.Z{
+	_, err = q.Client.ZAdd(ctx, q.toKey("repeat"), redis.Z{
 		Score:  float64(nextMillis),
 		Member: repeatJobKey,
 	}).Result()
@@ -685,7 +685,7 @@ func (q *Queue) addRepeatableJob(ctx context.Context, name string, jsonData stri
 		// ---------------
 
 		// Update the repeat set in Redis with the calculated nextMillis
-		_, err = q.Client.ZAdd(ctx, q.toKey("repeat"), &redis.Z{
+		_, err = q.Client.ZAdd(ctx, q.toKey("repeat"), redis.Z{
 			Score:  float64(nextMillis),
 			Member: repeatJobKey,
 		}).Result()
@@ -844,5 +844,5 @@ func (q *Queue) Remove(jobId string, removeChildren bool) error {
 
 // TrimEvents trims the event stream to the specified maximum length.
 func (q *Queue) TrimEvents(max int64) (int64, error) {
-	return q.Client.XTrim(q.ctx, q.KeyPrefix+"events", max).Result()
+	return q.Client.XTrimMaxLen(q.ctx, q.KeyPrefix+"events", max).Result()
 }
