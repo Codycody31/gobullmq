@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // MoveJobFromActiveToWait executes the Lua script moveJobFromActiveToWait on Redis with 9 keys.
-func MoveJobFromActiveToWait(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func MoveJobFromActiveToWait(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 9 {
 		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
 	}
@@ -75,7 +74,7 @@ if lockToken == token and pttl > 0 then
 end
 return pttl
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

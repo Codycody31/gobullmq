@@ -6,22 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"go.codycody31.dev/gobullmq"
-	"go.codycody31.dev/gobullmq/types"
 )
+
+// JobPayload is the typed data for our jobs.
+type JobPayload struct {
+	TaskID  int    `json:"taskId"`
+	Message string `json:"message"`
+}
 
 func main() {
 	queueName := "test"
-	ctx := context.Background()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	// Define Redis connection options
 	redisOpts := &redis.Options{
 		Addr: "127.0.0.1:6379",
-		// Password: "", // Add password if needed
-		DB: 0, // Default DB
+		DB:   0,
 	}
 
 	// Create separate redis clients for queue, worker, and events to avoid CLIENT SETNAME clashes
@@ -29,124 +37,130 @@ func main() {
 	workerClient := redis.NewClient(redisOpts)
 	eventsClient := redis.NewClient(redisOpts)
 
-	// Initialize the queue using functional options
-	queue, err := gobullmq.NewQueue(ctx, queueName, queueClient)
+	// Initialize the queue with typed data (no context in constructor, no I/O)
+	queue, err := gobullmq.NewQueue[JobPayload](queueName, queueClient, nil)
 	if err != nil {
 		fmt.Println("Error initializing queue:", err)
 		return
 	}
 
-	// Define the worker process function (V2 with API)
-	workerProcess := func(ctx context.Context, job *types.Job, api gobullmq.WorkerProcessAPI) (interface{}, error) {
-		fmt.Printf("Processing job: %s\n", job.Id)
-		fmt.Printf("Data: %v\n", job.Data)
+	// Define the worker process function with typed data and result
+	workerProcess := func(ctx context.Context, job *gobullmq.Job[JobPayload]) (string, error) {
+		fmt.Printf("Processing job: %s\n", job.ID())
+		fmt.Printf("Data: %+v\n", job.Data())
 
-		if job.RepeatJobKey != "" {
-			fmt.Printf("Repeat job key: %s\n", job.RepeatJobKey)
+		if job.RepeatJobKey() != "" {
+			fmt.Printf("Repeat job key: %s\n", job.RepeatJobKey())
 		}
 
-		// Update progress example
-		_ = api.UpdateProgress(ctx, 10)
-		// Extend lock example
-		_ = api.ExtendLock(ctx, 10*time.Second)
+		// Update progress and extend lock via job methods
+		_ = job.UpdateProgress(ctx, 10)
+		_ = job.ExtendLock(ctx, 10*time.Second)
 
 		r, _ := rand.Int(rand.Reader, big.NewInt(100))
 		if r.Int64() < 50 {
-			return nil, errors.New("job failed")
+			return "", errors.New("job failed")
 		}
 
 		return "ok", nil
 	}
 
-	// Initialize the worker (now requires V2 processor)
-	worker, err := gobullmq.NewWorker(ctx, queueName, gobullmq.WorkerOptions{
+	// Initialize the worker with typed data and result (no context in constructor)
+	worker, err := gobullmq.NewWorker[JobPayload, string](queueName, workerClient, workerProcess, &gobullmq.WorkerOptions{
 		Concurrency:     1,
 		StalledInterval: 30 * time.Second,
 		Backoff:         &gobullmq.BackoffOptions{Type: "exponential", Delay: 500},
-	}, workerClient, workerProcess)
+	})
 	if err != nil {
 		fmt.Println("Error initializing worker:", err)
 		return
 	}
 
 	// Initialize queue events
-	events, err := gobullmq.NewQueueEvents(ctx, queueName, gobullmq.QueueEventsOptions{
-		RedisClient: eventsClient,
-		Autorun:     true,
+	events, err := gobullmq.NewQueueEvents(ctx, queueName, eventsClient, &gobullmq.QueueEventsOptions{
+		Autorun: true,
 	})
 	if err != nil {
 		fmt.Println("Error initializing queue events:", err)
 		return
 	}
 
-	// Set up event listeners
-	events.On("completed", func(args ...interface{}) {
-		fmt.Println("Job completed:", args)
+	// Set up typed event listeners on QueueEvents (stream-based)
+	events.OnCompleted(func(evt gobullmq.CompletedEvent) {
+		fmt.Printf("Job %s completed (stream %s): %v\n", evt.JobID, evt.StreamID, evt.ReturnValue)
 	})
-	events.On("active", func(args ...interface{}) {
-		fmt.Println("Job active:", args)
+	events.OnFailed(func(evt gobullmq.FailedEvent) {
+		fmt.Printf("Job %s failed (stream %s): %s\n", evt.JobID, evt.StreamID, evt.FailedReason)
 	})
-	events.On("added", func(args ...interface{}) {
-		fmt.Println("Job added:", args)
+	events.OnActive(func(evt gobullmq.QueueEventData) {
+		fmt.Printf("Job %s active (stream %s)\n", evt.JobID, evt.StreamID)
 	})
-	events.On("error", func(args ...interface{}) {
-		fmt.Println("Error event:", args)
+	events.OnError(func(err error) {
+		fmt.Println("QueueEvents error:", err)
 	})
 
-	// Create job data struct
-	jobPayload := struct {
-		TaskID  int    `json:"taskId"`
-		Message string `json:"message"`
-	}{
+	// Create job data
+	jobPayload := JobPayload{
 		Message: "Processing job",
 	}
 
-	// Add jobs to the queue using the new Add signature
-	for i := 0; i < 10; i++ { // Reduced loop count for quicker testing
-		jobPayload.TaskID = i                                                            // Modify payload for each job
-		if _, err := queue.Add(ctx, "testJob", jobPayload, gobullmq.AddWithAttempts(3)); // Pass context and payload struct
-		// Example functional options:
-		// gobullmq.AddWithDelay(1000*i), // Delay each job slightly differently
-		// gobullmq.AddWithPriority(i%3),
-		err != nil {
+	// Add jobs to the queue
+	for i := 0; i < 10; i++ {
+		jobPayload.TaskID = i
+		if _, err := queue.Add(ctx, "testJob", jobPayload, gobullmq.AddWithAttempts(3)); err != nil {
 			fmt.Printf("Error adding job %d: %v\n", i, err)
 		}
 	}
 
-	// Example of adding a repeatable job:
+	// Example of adding a delayed job using time.Duration
+	_, err = queue.Add(ctx, "delayedJob", jobPayload,
+		gobullmq.AddWithDelay(2*time.Second),
+		gobullmq.AddWithAttempts(3),
+	)
+	if err != nil {
+		fmt.Println("Error adding delayed job:", err)
+	}
+
+	// Example of adding a repeatable job
 	_, err = queue.Add(ctx, "repeatableTest", jobPayload,
-		gobullmq.AddWithRepeat(types.JobRepeatOptions{
-			Every: 5000, // Repeat every second
+		gobullmq.AddWithRepeat(gobullmq.JobRepeatOptions{
+			Every: 5000,
 		}),
 	)
 	if err != nil {
 		fmt.Println("Error adding repeatable job:", err)
 	}
 
-	worker.On("completed", func(args ...interface{}) {
-		fmt.Println("Worker completed:", args)
+	// Set up typed event listeners on Worker (in-process)
+	worker.OnCompleted(func(job *gobullmq.Job[JobPayload], result string) {
+		fmt.Printf("Worker: job %s completed with result: %v\n", job.ID(), result)
 	})
-	worker.On("active", func(args ...interface{}) {
-		fmt.Println("Worker active:", args)
+	worker.OnFailed(func(job *gobullmq.Job[JobPayload], err error) {
+		fmt.Printf("Worker: job %s failed: %v\n", job.ID(), err)
 	})
-	worker.On("added", func(args ...interface{}) {
-		fmt.Println("Worker added:", args)
+	worker.OnActive(func(job *gobullmq.Job[JobPayload]) {
+		fmt.Printf("Worker: job %s active\n", job.ID())
 	})
-	worker.On("error", func(args ...interface{}) {
-		fmt.Println("Worker error:", args)
-	})
-	worker.On("failed", func(args ...interface{}) {
-		fmt.Println("Worker failed:", args)
+	worker.OnError(func(err error) {
+		fmt.Println("Worker error:", err)
 	})
 
-	// Run the worker
-	if err := worker.Run(); err != nil {
+	// Run the worker (context controls lifetime)
+	if err := worker.Run(ctx); err != nil {
 		fmt.Println("Error running worker:", err)
 	}
 
+	// Wait for shutdown signal (ctx will be cancelled by signal.NotifyContext)
 	worker.Wait()
 
 	// Clean up
-	worker.Close()
-	events.Close()
+	if err := worker.Close(); err != nil {
+		fmt.Println("Error closing worker:", err)
+	}
+	if err := events.Close(); err != nil {
+		fmt.Println("Error closing events:", err)
+	}
+	if err := queue.Close(ctx); err != nil {
+		fmt.Println("Error closing queue:", err)
+	}
 }

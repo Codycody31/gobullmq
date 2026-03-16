@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // MoveToActive executes the Lua script moveToActive on Redis with 10 keys.
-func MoveToActive(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func MoveToActive(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 10 {
 		return nil, fmt.Errorf("expected 10 keys but got %d", len(keys))
 	}
@@ -258,7 +257,7 @@ local nextTimestamp = getNextDelayedTimestamp(delayedKey)
 if (nextTimestamp ~= nil) then return {0, 0, 0, nextTimestamp} end
 return {0, 0, 0, 0}
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

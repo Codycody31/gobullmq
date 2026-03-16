@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // AddJob executes the Lua script addJob on Redis with 9 keys.
-func AddJob(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func AddJob(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 9 {
 		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
 	}
@@ -340,7 +339,7 @@ if parentDependenciesKey ~= nil then
 end
 return jobId .. "" -- convert to string
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

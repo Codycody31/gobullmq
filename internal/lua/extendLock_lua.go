@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // ExtendLock executes the Lua script extendLock on Redis with 2 keys.
-func ExtendLock(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func ExtendLock(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 2 {
 		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
 	}
@@ -35,7 +34,7 @@ if rcall("GET", KEYS[1]) == ARGV[1] then
 end
 return 0
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

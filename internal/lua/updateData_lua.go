@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // UpdateData executes the Lua script updateData on Redis with 1 keys.
-func UpdateData(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func UpdateData(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 1 {
 		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
 	}
@@ -31,7 +30,7 @@ else
   return -1
 end
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // ChangeDelay executes the Lua script changeDelay on Redis with 3 keys.
-func ChangeDelay(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func ChangeDelay(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 3 {
 		return nil, fmt.Errorf("expected 3 keys but got %d", len(keys))
 	}
@@ -46,7 +45,7 @@ if rcall("EXISTS", KEYS[2]) == 1 then
 else
   return -1
 end`
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

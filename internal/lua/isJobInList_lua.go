@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // IsJobInList executes the Lua script isJobInList on Redis with 1 keys.
-func IsJobInList(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func IsJobInList(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 1 {
 		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
 	}
@@ -37,7 +36,7 @@ end
 local items = redis.call("LRANGE", KEYS[1] , 0, -1)
 return checkItemInList(items, ARGV[1])
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

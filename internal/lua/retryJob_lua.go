@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // RetryJob executes the Lua script retryJob on Redis with 9 keys.
-func RetryJob(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func RetryJob(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 9 {
 		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
 	}
@@ -156,7 +155,7 @@ else
   return -1
 end
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

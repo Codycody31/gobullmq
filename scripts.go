@@ -10,55 +10,52 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.codycody31.dev/gobullmq/internal/lua"
-	"go.codycody31.dev/gobullmq/types"
 )
 
 type scripts struct {
-	redisClient redis.Cmdable   // Redis client used to interact with the redis server
-	ctx         context.Context // Context used to handle the queue events
+	redisClient redis.Cmdable
 	keyPrefix   string
 }
 
-func newScripts(redisClient redis.Cmdable, ctx context.Context, keyPrefix string) *scripts {
+func newScripts(redisClient redis.Cmdable, keyPrefix string) *scripts {
 	return &scripts{
 		redisClient: redisClient,
-		ctx:         ctx,
 		keyPrefix:   keyPrefix,
 	}
 }
 
-func (s *scripts) moveToFailedArgs(job *types.Job, failedReason string, removeOnFailed types.KeepJobs, token string, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []interface{}, error) {
+func (s *scripts) moveToFailedArgs(job *rawJob, failedReason string, removeOnFailed KeepJobs, token string, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []interface{}, error) {
 	timestamp := time.Now()
 	return s.moveToFinishedArgs(job, failedReason, "failedReason", removeOnFailed, "failed", token, timestamp, fetchNext, lockDurationMs, maxMetricsSize)
 }
 
 // getKeepJobs determines the job retention policy based on provided parameters
-func (s *scripts) getKeepJobs(shouldRemove interface{}, workerKeepJobs *types.KeepJobs) types.KeepJobs {
+func (s *scripts) getKeepJobs(shouldRemove interface{}, workerKeepJobs *KeepJobs) KeepJobs {
 	// If shouldRemove is nil/undefined, use workerKeepJobs or default
 	if shouldRemove == nil {
 		if workerKeepJobs != nil {
 			return *workerKeepJobs
 		}
-		return types.KeepJobs{Count: -1} // keep all
+		return KeepJobs{Count: -1} // keep all
 	}
 
 	// Handle different types of shouldRemove
 	switch v := shouldRemove.(type) {
-	case types.KeepJobs:
+	case KeepJobs:
 		return v
 	case int:
-		return types.KeepJobs{Count: v}
+		return KeepJobs{Count: v}
 	case bool:
 		if v {
-			return types.KeepJobs{Count: 0} // Remove all (keep none)
+			return KeepJobs{Count: 0} // Remove all (keep none)
 		}
-		return types.KeepJobs{Count: -1} // Keep all
+		return KeepJobs{Count: -1} // Keep all
 	default:
-		return types.KeepJobs{Count: -1} // Keep all
+		return KeepJobs{Count: -1} // Keep all
 	}
 }
 
-func (s *scripts) moveToFinishedArgs(job *types.Job, value string, propValue string, shouldRemove interface{}, target string, token string, timestamp time.Time, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []interface{}, error) {
+func (s *scripts) moveToFinishedArgs(job *rawJob, value string, propValue string, shouldRemove interface{}, target string, token string, timestamp time.Time, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []interface{}, error) {
 	// Build the keys array - equivalent to moveToFinishedKeys in JS
 	keys := []string{
 		s.keyPrefix + "wait",
@@ -72,23 +69,23 @@ func (s *scripts) moveToFinishedArgs(job *types.Job, value string, propValue str
 		s.keyPrefix + "meta",
 		s.keyPrefix + "pc",
 		s.keyPrefix + target,
-		s.keyPrefix + job.Id,
+		s.keyPrefix + job.id,
 		s.keyPrefix + "metrics:" + target,
 	}
 
 	// Convert job data to JSON string for the event
 	eventData, err := json.Marshal(map[string]interface{}{
-		"jobId": job.Id,
+		"jobId": job.id,
 		"val":   value,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to marshal event data: %v", err)
+		return nil, nil, fmt.Errorf("failed to marshal event data: %w", err)
 	}
-	var workerKeepJobs *types.KeepJobs // or the appropriate type
+	var workerKeepJobs *KeepJobs
 	if target == "completed" {
-		workerKeepJobs = job.Opts.RemoveOnComplete
+		workerKeepJobs = job.opts.RemoveOnComplete
 	} else {
-		workerKeepJobs = job.Opts.RemoveOnFail
+		workerKeepJobs = job.opts.RemoveOnFail
 	}
 	var keepJobs = s.getKeepJobs(shouldRemove, workerKeepJobs)
 	var payload map[string]interface{}
@@ -106,28 +103,28 @@ func (s *scripts) moveToFinishedArgs(job *types.Job, value string, propValue str
 		"token":          token,
 		"keepJobs":       payload,
 		"lockDuration":   lockDurationMs,
-		"attempts":       job.Opts.Attempts,
-		"attemptsMade":   job.AttemptsMade,
+		"attempts":       job.opts.Attempts,
+		"attemptsMade":   job.attemptsMade,
 		"maxMetricsSize": maxMetricsSize,
-		"fpof":           job.Opts.FailParentOnFailure,       // Use value from job options
-		"rdof":           job.Opts.RemoveDependencyOnFailure, // Use value from job options
-		"parentKey":      job.ParentKey,                      // Pass parent key
+		"fpof":           job.opts.FailParentOnFailure,
+		"rdof":           job.opts.RemoveDependencyOnFailure,
+		"parentKey":      job.parentKey,
 	}
 	// Pack options using msgpack
 	packedOpts, err := msgpack.Marshal(opts)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to marshal options: %v", err)
+		return nil, nil, fmt.Errorf("failed to marshal options: %w", err)
 	}
 
 	// Build the args array
 	args := []interface{}{
-		job.Id,
+		job.id,
 		timestamp.UnixMilli(),
 		propValue,
 		value,
 		target,
 		string(eventData),
-		fetchNext && !false, // Replace with worker.closing check when available
+		fetchNext,
 		s.keyPrefix,
 		packedOpts,
 	}
@@ -207,8 +204,8 @@ func (s *scripts) moveToDelayedArgs(jobId string, timestampMillis int64, token s
 	return keys, args
 }
 
-// UpdateProgress updates the progress of a job
-func (s *scripts) updateProgress(jobId string, progress interface{}) error {
+// updateProgress updates the progress of a job.
+func (s *scripts) updateProgress(ctx context.Context, jobId string, progress interface{}) error {
 	keys := []string{
 		s.keyPrefix + jobId,
 		s.keyPrefix + jobId + ":events",
@@ -219,7 +216,7 @@ func (s *scripts) updateProgress(jobId string, progress interface{}) error {
 		return err
 	}
 
-	result, err := lua.UpdateProgress(s.redisClient, keys, jobId, progressJson)
+	result, err := lua.UpdateProgress(ctx, s.redisClient, keys, jobId, progressJson)
 	if err != nil {
 		return err
 	}
@@ -230,14 +227,14 @@ func (s *scripts) updateProgress(jobId string, progress interface{}) error {
 	}
 
 	if resultInt64 == -1 {
-		return fmt.Errorf("job not found")
+		return ErrJobNotFound
 	}
 
 	return nil
 }
 
-// updateData updates the job's data field atomically in Redis
-func (s *scripts) updateData(jobId string, data interface{}) error {
+// updateData updates the job's data field atomically in Redis.
+func (s *scripts) updateData(ctx context.Context, jobId string, data interface{}) error {
 	keys := []string{
 		s.keyPrefix + jobId,
 	}
@@ -247,7 +244,7 @@ func (s *scripts) updateData(jobId string, data interface{}) error {
 		return err
 	}
 
-	result, err := lua.UpdateData(s.redisClient, keys, string(dataJson))
+	result, err := lua.UpdateData(ctx, s.redisClient, keys, string(dataJson))
 	if err != nil {
 		return err
 	}
@@ -256,14 +253,14 @@ func (s *scripts) updateData(jobId string, data interface{}) error {
 		return fmt.Errorf("invalid result type: %T", result)
 	}
 	if resultInt64 == -1 {
-		return fmt.Errorf("job not found")
+		return ErrJobNotFound
 	}
 	return nil
 }
 
 // moveJobFromActiveToWait moves a job back from Active to Wait when manually rate limited.
 // It returns the remaining TTL (in ms) for the limiter key, clamped to 0 if negative.
-func (s *scripts) moveJobFromActiveToWait(jobId string, token string) (int64, error) {
+func (s *scripts) moveJobFromActiveToWait(ctx context.Context, jobId string, token string) (int64, error) {
 	keys := []string{
 		s.keyPrefix + "active",
 		s.keyPrefix + "wait",
@@ -282,7 +279,7 @@ func (s *scripts) moveJobFromActiveToWait(jobId string, token string) (int64, er
 		s.keyPrefix + jobId,
 	}
 
-	result, err := lua.MoveJobFromActiveToWait(s.redisClient, keys, args...)
+	result, err := lua.MoveJobFromActiveToWait(ctx, s.redisClient, keys, args...)
 	if err != nil {
 		return 0, err
 	}

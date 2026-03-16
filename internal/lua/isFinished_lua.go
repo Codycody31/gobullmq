@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // IsFinished executes the Lua script isFinished on Redis with 3 keys.
-func IsFinished(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func IsFinished(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 3 {
 		return nil, fmt.Errorf("expected 3 keys but got %d", len(keys))
 	}
@@ -54,7 +53,7 @@ if ARGV[2] == "1" then
 end
 return 0
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

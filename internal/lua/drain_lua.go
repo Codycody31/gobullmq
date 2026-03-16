@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // Drain executes the Lua script drain on Redis with 4 keys.
-func Drain(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func Drain(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 4 {
 		return nil, fmt.Errorf("expected 4 keys but got %d", len(keys))
 	}
@@ -295,7 +294,7 @@ if KEYS[3] ~= "" then
 end
 removeZSetJobs(KEYS[4], true, queueBaseKey, 0) --prioritized
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

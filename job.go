@@ -9,63 +9,276 @@ import (
 
 	"github.com/redis/go-redis/v9"
 	"go.codycody31.dev/gobullmq/internal/lua"
-	"go.codycody31.dev/gobullmq/types"
 )
 
 const (
 	_DEFAULT_JOB_NAME = "__default__"
 )
 
-func JobFromId(ctx context.Context, client redis.Cmdable, queueKey string, jobId string) (types.Job, error) {
+// JobState represents the state of a job in the queue.
+type JobState string
+
+const (
+	JobStateCompleted       JobState = "completed"
+	JobStateWaiting         JobState = "wait"
+	JobStateActive          JobState = "active"
+	JobStatePaused          JobState = "paused"
+	JobStatePrioritized     JobState = "prioritized"
+	JobStateDelayed         JobState = "delayed"
+	JobStateFailed          JobState = "failed"
+	JobStateWaitingChildren JobState = "waiting-children"
+)
+
+// EventType represents a queue event type emitted via Redis streams.
+type EventType string
+
+const (
+	EventCompleted        EventType = "completed"
+	EventWaiting          EventType = "wait"
+	EventActive           EventType = "active"
+	EventPaused           EventType = "paused"
+	EventPrioritized      EventType = "prioritized"
+	EventDelayed          EventType = "delayed"
+	EventFailed           EventType = "failed"
+	EventWaitingChildren  EventType = "waiting-children"
+	EventRemoved          EventType = "removed"
+	EventDuplicated       EventType = "duplicated"
+	EventRetriesExhausted EventType = "retries-exhausted"
+	EventDrained          EventType = "drained"
+	EventProgress         EventType = "progress"
+	EventStalled          EventType = "stalled"
+	EventAdded            EventType = "added"
+	EventResumed          EventType = "resumed"
+	EventCleaned          EventType = "cleaned"
+)
+
+// ParentOpts defines options for job parent relationships.
+type ParentOpts struct {
+	ID    string `json:"id" msgpack:"id"`
+	Queue string `json:"queue" msgpack:"queue"`
+}
+
+// KeepJobs specifies how many completed/failed jobs to keep.
+type KeepJobs struct {
+	Age   int `json:"age,omitempty" msgpack:"age,omitempty"`
+	Count int `json:"count,omitempty" msgpack:"count,omitempty"`
+}
+
+// UnmarshalJSON normalizes bool, int, or object into KeepJobs.
+func (k *KeepJobs) UnmarshalJSON(b []byte) error {
+	var boolVal bool
+	if err := json.Unmarshal(b, &boolVal); err == nil {
+		if boolVal {
+			k.Count = 0
+		} else {
+			k.Count = -1
+		}
+		return nil
+	}
+	var intVal int
+	if err := json.Unmarshal(b, &intVal); err == nil {
+		k.Count = intVal
+		return nil
+	}
+	type alias KeepJobs
+	var tmp alias
+	if err := json.Unmarshal(b, &tmp); err == nil {
+		*k = KeepJobs(tmp)
+		return nil
+	}
+	k.Count = -1
+	return nil
+}
+
+// BackoffOptions configures retry backoff strategy for a job.
+type BackoffOptions struct {
+	Type  string `json:"type" msgpack:"type"`
+	Delay int    `json:"delay" msgpack:"delay"`
+}
+
+// JobRepeatOptions defines options for configuring repeatable jobs.
+type JobRepeatOptions struct {
+	CurrentDate  *time.Time `json:"currentDate,omitempty" msgpack:"currentDate,omitempty"`
+	StartDate    *time.Time `json:"startDate,omitempty" msgpack:"startDate,omitempty"`
+	EndDate      *time.Time `json:"endDate,omitempty" msgpack:"endDate,omitempty"`
+	UTC          bool       `json:"utc,omitempty" msgpack:"utc,omitempty"`
+	TZ           string     `json:"tz,omitempty" msgpack:"tz,omitempty"`
+	NthDayOfWeek int        `json:"nthDayOfWeek,omitempty" msgpack:"nthDayOfWeek,omitempty"`
+	Pattern      string     `json:"pattern,omitempty" msgpack:"pattern,omitempty"`
+	Limit        int        `json:"limit,omitempty" msgpack:"limit,omitempty"`
+	Every        int        `json:"every,omitempty" msgpack:"every,omitempty"`
+	Immediately  bool       `json:"immediately,omitempty" msgpack:"immediately,omitempty"`
+	Count        int        `json:"count,omitempty" msgpack:"count,omitempty"`
+	PrevMillis   int        `json:"prevMillis,omitempty" msgpack:"prevMillis,omitempty"`
+	Offset       int        `json:"offset,omitempty" msgpack:"offset,omitempty"`
+	JobID        string     `json:"jobId,omitempty" msgpack:"jobId,omitempty"`
+}
+
+// JobOptions defines options for configuring a job.
+type JobOptions struct {
+	Priority                  int               `json:"priority,omitempty" msgpack:"priority,omitempty"`
+	RemoveOnComplete          *KeepJobs         `json:"removeOnComplete,omitempty" msgpack:"removeOnComplete,omitempty"`
+	RemoveOnFail              *KeepJobs         `json:"removeOnFail,omitempty" msgpack:"removeOnFail,omitempty"`
+	Attempts                  int               `json:"attempts,omitempty" msgpack:"attempts,omitempty"`
+	Delay                     int               `json:"delay,omitempty" msgpack:"delay,omitempty"`
+	Timestamp                 int64             `json:"timestamp,omitempty" msgpack:"timestamp,omitempty"`
+	Lifo                      bool              `json:"lifo,omitempty" msgpack:"lifo,omitempty"`
+	JobID                     string            `json:"jobId,omitempty" msgpack:"jobId,omitempty"`
+	RepeatJobKey              string            `json:"repeatJobKey,omitempty" msgpack:"repeatJobKey,omitempty"`
+	Token                     string            `json:"token,omitempty" msgpack:"token,omitempty"`
+	Repeat                    *JobRepeatOptions `json:"repeat,omitempty" msgpack:"repeat,omitempty"`
+	FailParentOnFailure       bool              `json:"failParentOnFailure,omitempty" msgpack:"failParentOnFailure,omitempty"`
+	Parent                    *ParentOpts       `json:"parent,omitempty" msgpack:"parent,omitempty"`
+	RemoveDependencyOnFailure bool              `json:"removeDependencyOnFailure,omitempty" msgpack:"removeDependencyOnFailure,omitempty"`
+	Backoff                   *BackoffOptions   `json:"backoff,omitempty" msgpack:"backoff,omitempty"`
+	WaitChildren              bool              `json:"-" msgpack:"-"`
+}
+
+// rawJob is the internal untyped job representation used for Redis wire-format operations.
+// All fields are unexported; the public API uses Job[D] which wraps rawJob.
+type rawJob struct {
+	id           string
+	name         string
+	data         interface{} // raw data (JSON string from Redis, or pre-marshal Go value)
+	opts         JobOptions
+	optsByJSON   []byte
+	parentKey    string
+	timestamp    int64
+	progress     int
+	delay        int
+	finishedOn   time.Time
+	processedOn  time.Time
+	repeatJobKey string
+	failedReason string
+	attemptsMade int
+	returnValue  interface{}
+	token        string
+
+	client    redis.Cmdable
+	keyPrefix string
+}
+
+func (j *rawJob) setJobContext(client redis.Cmdable, prefix string) {
+	j.client = client
+	j.keyPrefix = prefix
+}
+
+func (j *rawJob) hasJobContext() bool {
+	return j.client != nil && j.keyPrefix != ""
+}
+
+func (j *rawJob) toJSONData() error {
+	data, err := json.Marshal(j.opts)
+	if err != nil {
+		return err
+	}
+	j.optsByJSON = data
+	return nil
+}
+
+// Job is the public typed wrapper around an internal rawJob.
+// D is the type of the job's data payload.
+type Job[D any] struct {
+	raw  *rawJob
+	data D
+}
+
+// wrapRawJob deserializes a rawJob's data field into type D and returns a typed Job[D].
+func wrapRawJob[D any](raw *rawJob) (*Job[D], error) {
+	var data D
+	switch v := raw.data.(type) {
+	case string:
+		if v != "" {
+			if err := json.Unmarshal([]byte(v), &data); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal job data: %w", err)
+			}
+		}
+	case []byte:
+		if len(v) > 0 {
+			if err := json.Unmarshal(v, &data); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal job data: %w", err)
+			}
+		}
+	default:
+		b, err := json.Marshal(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal job data for type conversion: %w", err)
+		}
+		if err := json.Unmarshal(b, &data); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal job data: %w", err)
+		}
+	}
+	return &Job[D]{raw: raw, data: data}, nil
+}
+
+// --- Accessor methods ---
+
+func (j *Job[D]) ID() string              { return j.raw.id }
+func (j *Job[D]) Name() string            { return j.raw.name }
+func (j *Job[D]) Data() D                 { return j.data }
+func (j *Job[D]) Opts() JobOptions        { return j.raw.opts }
+func (j *Job[D]) ParentKey() string        { return j.raw.parentKey }
+func (j *Job[D]) Timestamp() int64        { return j.raw.timestamp }
+func (j *Job[D]) Progress() int           { return j.raw.progress }
+func (j *Job[D]) Delay() int              { return j.raw.delay }
+func (j *Job[D]) FinishedOn() time.Time   { return j.raw.finishedOn }
+func (j *Job[D]) ProcessedOn() time.Time  { return j.raw.processedOn }
+func (j *Job[D]) RepeatJobKey() string     { return j.raw.repeatJobKey }
+func (j *Job[D]) FailedReason() string     { return j.raw.failedReason }
+func (j *Job[D]) AttemptsMade() int        { return j.raw.attemptsMade }
+func (j *Job[D]) ReturnValue() interface{} { return j.raw.returnValue }
+func (j *Job[D]) Token() string            { return j.raw.token }
+
+// --- Internal job loading functions ---
+
+// jobFromId loads a job from Redis by its ID.
+// Returns ErrJobNotFound if the job does not exist.
+func jobFromId(ctx context.Context, client redis.Cmdable, queueKey string, jobId string) (rawJob, error) {
 	jobData, err := client.HGetAll(ctx, queueKey+jobId).Result()
 	if err != nil {
-		return types.Job{}, err
+		return rawJob{}, err
 	}
 
 	if len(jobData) == 0 {
-		return types.Job{}, nil
+		return rawJob{}, ErrJobNotFound
 	}
 
-	// Convert map[string]string from HGetAll to map[string]interface{}
 	jobDataInterface := make(map[string]interface{}, len(jobData))
 	for k, v := range jobData {
 		jobDataInterface[k] = v
 	}
 
-	job, err := JobFromJson(jobDataInterface)
+	job, err := jobFromJson(jobDataInterface)
 	if err != nil {
-		return types.Job{}, err
+		return rawJob{}, err
 	}
 
 	return job, nil
 }
 
-func JobFromJson(jobData map[string]interface{}) (types.Job, error) {
-	// Get raw strings/values, handle missing keys and type assertions gracefully
-	dataVal, _ := jobData["data"]               // Data might be nil or string initially
-	optsStr, optsOk := jobData["opts"].(string) // Opts should be a JSON string
+// jobFromJson creates a rawJob from a map of string key-value pairs.
+func jobFromJson(jobData map[string]interface{}) (rawJob, error) {
+	dataVal, _ := jobData["data"]
+	optsStr, optsOk := jobData["opts"].(string)
 	nameStr, _ := jobData["name"].(string)
 	idStr, _ := jobData["id"].(string)
 
-	// If opts string is missing or empty, create default opts
-	var opts types.JobOptions
+	var opts JobOptions
 	var err error
 	if optsOk && optsStr != "" {
-		opts, err = JobOptsFromJson(optsStr)
+		opts, err = jobOptsFromJson(optsStr)
 		if err != nil {
-			return types.Job{}, fmt.Errorf("failed to parse job options JSON string: %w", err)
+			return rawJob{}, fmt.Errorf("failed to parse job options JSON string: %w", err)
 		}
 	}
-	// If opts is missing or empty, use default struct (already initialized)
 
-	job := types.Job{
-		Name: nameStr,
-		Data: dataVal, // Keep data as interface{} for now
-		Opts: opts,
-		Id:   idStr,
+	job := rawJob{
+		name: nameStr,
+		data: dataVal,
+		opts: opts,
+		id:   idStr,
 	}
 
-	// Helper for safe string conversion and parsing
 	parseStrToInt := func(key string) int {
 		if strVal, ok := jobData[key].(string); ok {
 			if val, err := strconv.Atoi(strVal); err == nil {
@@ -85,241 +298,97 @@ func JobFromJson(jobData map[string]interface{}) (types.Job, error) {
 	parseStrToTime := func(key string) time.Time {
 		tsVal := parseStrToInt64(key)
 		if tsVal > 0 {
-			return time.Unix(tsVal, 0)
+			return time.UnixMilli(tsVal)
 		}
 		return time.Time{}
 	}
 
-	// Parse other fields from strings (with checks)
-	job.TimeStamp = parseStrToInt64("timestamp")
-	job.Progress = parseStrToInt("progress")
-	job.Delay = parseStrToInt("delay")
-	job.FinishedOn = parseStrToTime("finishedOn")
-	job.ProcessedOn = parseStrToTime("processedOn")
+	job.timestamp = parseStrToInt64("timestamp")
+	job.progress = parseStrToInt("progress")
+	job.delay = parseStrToInt("delay")
+	job.finishedOn = parseStrToTime("finishedOn")
+	job.processedOn = parseStrToTime("processedOn")
 	if rjkStr, ok := jobData["rjk"].(string); ok {
-		job.RepeatJobKey = rjkStr
+		job.repeatJobKey = rjkStr
 	}
 	if frStr, ok := jobData["failedReason"].(string); ok {
-		job.FailedReason = frStr
+		job.failedReason = frStr
 	}
-	job.AttemptsMade = parseStrToInt("attemptsMade")
-	// Parse parentKey
+	job.attemptsMade = parseStrToInt("attemptsMade")
 	if pkStr, ok := jobData["parentKey"].(string); ok {
-		job.ParentKey = pkStr
+		job.parentKey = pkStr
 	}
 
-	// Handle return value (might already be interface{}, or json string)
 	if retVal, ok := jobData["returnvalue"]; ok {
 		if retStr, okStr := retVal.(string); okStr {
 			var parsedRet interface{}
 			if err := json.Unmarshal([]byte(retStr), &parsedRet); err == nil {
-				job.Returnvalue = parsedRet
+				job.returnValue = parsedRet
 			} else {
-				// If unmarshal fails, store raw string?
-				job.Returnvalue = retStr
+				job.returnValue = retStr
 			}
 		} else {
-			// If not a string, store the value directly
-			job.Returnvalue = retVal
+			job.returnValue = retVal
 		}
 	}
 
 	return job, nil
 }
 
-// jobOptsDecodeMap maps JSON keys to struct field names.
-var jobOptsDecodeMap = map[string]string{
-	"priority":         "Priority",
-	"removeOnComplete": "RemoveOnComplete",
-	"removeOnFail":     "RemoveOnFail",
-	"attempts":         "Attempts",
-	"delay":            "Delay",
-	"timestamp":        "TimeStamp",
-	"lifo":             "Lifo",
-	"jobId":            "JobId",
-	"repeatJobKey":     "RepeatJobKey",
-	"token":            "Token",
-	"currentDate":      "CurrentDate",
-	"startDate":        "StartDate",
-	"endDate":          "EndDate",
-	"utc":              "UTC",
-	"tz":               "TZ",
-	"nthDayOfWeek":     "NthDayOfWeek",
-	"pattern":          "Pattern",
-	"limit":            "Limit",
-	"every":            "Every",
-	"immediately":      "Immediately",
-	"count":            "Count",
-}
-
-func JobOptsFromJson(rawOpts string) (types.JobOptions, error) {
-	var jobOpts types.JobOptions
+// jobOptsFromJson unmarshals a JSON string into JobOptions.
+func jobOptsFromJson(rawOpts string) (JobOptions, error) {
+	var jobOpts JobOptions
 	if err := json.Unmarshal([]byte(rawOpts), &jobOpts); err != nil {
 		return jobOpts, fmt.Errorf("failed to unmarshal job opts: %w", err)
 	}
 	return jobOpts, nil
 }
 
-// we don't need this as it can be directly unmarshaled with JobOptsFromJson
-// but for type safety we can still use this _JobOptsFromJson.
-
-func _JobOptsFromJson(rawOpts string) (types.JobOptions, error) {
-	var tempMap map[string]interface{}
-	var jobOpts types.JobOptions
-
-	if err := json.Unmarshal([]byte(rawOpts), &tempMap); err != nil {
-		return jobOpts, fmt.Errorf("failed to unmarshal raw opts JSON: %w", err)
-	}
-
-	// Helper function for safe type assertion to float64 then int/int64
-	parseInt := func(key string) int {
-		if val, ok := tempMap[key].(float64); ok {
-			return int(val)
-		}
-		return 0
-	}
-	parseInt64 := func(key string) int64 {
-		if val, ok := tempMap[key].(float64); ok {
-			return int64(val)
-		}
-		return 0
-	}
-	parseBool := func(key string) bool {
-		if val, ok := tempMap[key].(bool); ok {
-			return val
-		}
-		return false
-	}
-	parseString := func(key string) string {
-		if val, ok := tempMap[key].(string); ok {
-			return val
-		}
-		return ""
-	}
-
-	// Parse simple fields
-	jobOpts.Priority = parseInt("priority")
-	jobOpts.Attempts = parseInt("attempts")
-	jobOpts.Delay = parseInt("delay")
-	jobOpts.TimeStamp = parseInt64("timestamp")
-	jobOpts.Lifo = parseBool("lifo") // Ensure Lifo is bool
-	jobOpts.JobId = parseString("jobId")
-	jobOpts.RepeatJobKey = parseString("repeatJobKey")
-	jobOpts.Token = parseString("token")
-	jobOpts.FailParentOnFailure = parseBool("failParentOnFailure")
-
-	// Parse nested pointer fields
-	parseNested := func(key string, target interface{}) error {
-		if rawVal, ok := tempMap[key]; ok && rawVal != nil {
-			// Re-marshal the interface{} value back to JSON bytes
-			bytes, err := json.Marshal(rawVal)
-			if err != nil {
-				return fmt.Errorf("failed to re-marshal nested field %s: %w", key, err)
-			}
-			// Unmarshal the bytes into the target pointer
-			if err := json.Unmarshal(bytes, target); err != nil {
-				return fmt.Errorf("failed to unmarshal nested field %s: %w", key, err)
-			}
-		}
-		return nil
-	}
-
-	// var removeOnCompleteOpt types.KeepJobs
-	// if err := parseNested("removeOnComplete", &removeOnCompleteOpt); err == nil && (removeOnCompleteOpt.Age != 0 || removeOnCompleteOpt.Count != 0) {
-	// 	jobOpts.RemoveOnComplete = &removeOnCompleteOpt
-	// }
-	var removeOnCompleteOpt types.KeepJobs
-	if err := parseNested("removeOnComplete", &removeOnCompleteOpt); err == nil {
-		jobOpts.RemoveOnComplete = &removeOnCompleteOpt
-	}
-
-	var removeOnFailOpt types.KeepJobs
-	if err := parseNested("removeOnFail", &removeOnFailOpt); err == nil {
-		jobOpts.RemoveOnFail = &removeOnFailOpt
-	}
-
-	var repeatOpt types.JobRepeatOptions
-	if err := parseNested("repeat", &repeatOpt); err == nil && (repeatOpt.Every != 0 || repeatOpt.Pattern != "") {
-		jobOpts.Repeat = &repeatOpt
-	}
-
-	var parentOpt types.ParentOpts
-	if err := parseNested("parent", &parentOpt); err == nil && parentOpt.Id != "" {
-		jobOpts.Parent = &parentOpt
-	}
-
-	return jobOpts, nil
-}
-
-// JobMoveToFailed moves a job to the 'failed' set in Redis.
-// It requires the scripts instance for Redis interaction.
-func JobMoveToFailed(s *scripts, job *types.Job, err error, token string, removeOnFailed types.KeepJobs, fetchNext bool, lockDurationMs int, maxMetricsSize string) error {
-	job.FailedReason = err.Error()
-
-	// TODO: Consider saving stacktrace here if needed, similar to JS version.
-
-	keys, args, scriptErr := s.moveToFailedArgs(job, job.FailedReason, removeOnFailed, token, fetchNext, lockDurationMs, maxMetricsSize)
+// jobMoveToFailed moves a job to the 'failed' set in Redis.
+func jobMoveToFailed(ctx context.Context, s *scripts, job *rawJob, err error, token string, removeOnFailed KeepJobs, fetchNext bool, lockDurationMs int, maxMetricsSize string) error {
+	job.failedReason = err.Error()
+	keys, args, scriptErr := s.moveToFailedArgs(job, job.failedReason, removeOnFailed, token, fetchNext, lockDurationMs, maxMetricsSize)
 	if scriptErr != nil {
-		// Consider emitting an error event here or logging
-		return fmt.Errorf("error preparing move to failed args for job %s: %w", job.Id, scriptErr)
+		return fmt.Errorf("error preparing move to failed args for job %s: %w", job.id, scriptErr)
 	}
-
-	// Use the keys and args here to call the appropriate Lua script
-	_, luaErr := lua.MoveToFinished(s.redisClient, keys, args...)
+	_, luaErr := lua.MoveToFinished(ctx, s.redisClient, keys, args...)
 	if luaErr != nil {
-		// Consider emitting an error event here or logging
-		return fmt.Errorf("error executing move to failed via Lua for job %s: %w", job.Id, luaErr)
+		return fmt.Errorf("error executing move to failed via Lua for job %s: %w", job.id, luaErr)
 	}
-
-	// TODO: Consider emitting a 'failed' event here, although the worker currently does this.
-
 	return nil
 }
 
-func newJob(name string, data types.JobData, opts types.JobOptions) (types.Job, error) {
+func newJob(name string, data interface{}, opts JobOptions) (rawJob, error) {
 	op := setOpts(opts)
 	if name == "" {
 		name = _DEFAULT_JOB_NAME
 	}
-
-	curJob := types.Job{
-		Opts:         op,
-		Name:         name,
-		Data:         data,
-		Progress:     0,
-		Delay:        op.Delay,
-		TimeStamp:    op.TimeStamp,
-		AttemptsMade: 0,
+	curJob := rawJob{
+		opts:         op,
+		name:         name,
+		data:         data,
+		progress:     0,
+		delay:        op.Delay,
+		timestamp:    op.Timestamp,
+		attemptsMade: 0,
 	}
-
-	err := curJob.ToJsonData()
+	err := curJob.toJSONData()
 	if err != nil {
 		return curJob, err
 	}
-
 	return curJob, nil
 }
 
-func setOpts(opts types.JobOptions) types.JobOptions {
+func setOpts(opts JobOptions) JobOptions {
 	op := opts
-
-	if opts.Delay < 0 {
-		opts.Delay = 0
+	if op.Delay < 0 {
+		op.Delay = 0
 	}
-
-	if opts.Attempts == 0 {
+	if op.Attempts == 0 {
 		op.Attempts = 1
-	} else {
-		op.Attempts = opts.Attempts
 	}
-
-	op.Delay = opts.Delay
-
-	if opts.TimeStamp == 0 {
-		op.TimeStamp = time.Now().Unix()
-	} else {
-		op.TimeStamp = opts.TimeStamp
+	if op.Timestamp == 0 {
+		op.Timestamp = time.Now().UnixMilli()
 	}
-
 	return op
 }

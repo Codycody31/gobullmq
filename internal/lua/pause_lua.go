@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // Pause executes the Lua script pause on Redis with 5 keys.
-func Pause(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func Pause(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 5 {
 		return nil, fmt.Errorf("expected 5 keys but got %d", len(keys))
 	}
@@ -53,7 +52,7 @@ else
 end
 rcall("XADD", KEYS[5], "*", "event", ARGV[1]);
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

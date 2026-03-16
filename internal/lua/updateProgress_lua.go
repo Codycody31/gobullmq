@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // UpdateProgress executes the Lua script updateProgress on Redis with 2 keys.
-func UpdateProgress(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func UpdateProgress(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 2 {
 		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
 	}
@@ -36,7 +35,7 @@ else
   return -1
 end
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // MoveStalledJobsToWait executes the Lua script moveStalledJobsToWait on Redis with 8 keys.
-func MoveStalledJobsToWait(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func MoveStalledJobsToWait(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 8 {
 		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
 	}
@@ -501,7 +500,7 @@ end
 return checkStalledJobs(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6],
                         KEYS[7], KEYS[8], ARGV[1], ARGV[2], ARGV[3], ARGV[4])
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

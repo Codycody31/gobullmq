@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // GetCounts executes the Lua script getCounts on Redis with 1 keys.
-func GetCounts(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func GetCounts(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 1 {
 		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
 	}
@@ -46,7 +45,7 @@ for i = 1, #ARGV do
 end
 return results
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

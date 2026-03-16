@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // GetStateV2 executes the Lua script getStateV2 on Redis with 8 keys.
-func GetStateV2(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func GetStateV2(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 8 {
 		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
 	}
@@ -62,7 +61,7 @@ if rcall("ZSCORE", KEYS[7] , ARGV[1]) ~= false then
 end
 return "unknown"
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

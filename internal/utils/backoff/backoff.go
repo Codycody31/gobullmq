@@ -25,10 +25,11 @@ var builtinStrategies = map[string]func(delay int) Strategy{
 			if attemptsMade <= 0 {
 				attemptsMade = 1
 			}
+			const maxBackoffMs = 86_400_000 // 24 hours
 			factor := math.Pow(2, float64(attemptsMade-1))
 			d := int(math.Round(factor * float64(delay)))
-			if d < 0 {
-				return 0
+			if d < 0 || d > maxBackoffMs {
+				d = maxBackoffMs
 			}
 			return d
 		}

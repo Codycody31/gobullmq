@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // Promote executes the Lua script promote on Redis with 7 keys.
-func Promote(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func Promote(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 7 {
 		return nil, fmt.Errorf("expected 7 keys but got %d", len(keys))
 	}
@@ -92,7 +91,7 @@ if rcall("ZREM", KEYS[1], jobId) == 1 then
 else
   return -3
 end`
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

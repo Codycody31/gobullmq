@@ -6,82 +6,80 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
 	eventemitter "go.codycody31.dev/gobullmq/internal/eventEmitter"
 )
 
-// QueueEventsIface is an interface for the QueueEvents struct and defines the methods that can be used to interact with the queue events
-type QueueEventsIface interface {
-	Emit(event string, args ...interface{})
-	Off(event string, listener func(...interface{}))
-	On(event string, listener func(...interface{}))
-	Once(event string, listener func(...interface{}))
-	Run() error
-	Close()
-}
-
-var _ QueueEventsIface = (*QueueEvents)(nil)
-
 type QueueEvents struct {
-	Name        string                     // Name of the queue
-	Token       uuid.UUID                  // Token used to identify the queue events
+	name        string                     // Name of the queue
+	token       uuid.UUID                  // Token used to identify the queue events
 	ee          *eventemitter.EventEmitter // Event emitter used to handle events occuring in worker threads/go routines/etc
-	running     bool                       // Flag to indicate if the queue events is running
-	closing     bool                       // Flag to indicate if the queue events is closing
+	running     atomic.Bool                // Flag to indicate if the queue events is running
+	closing     atomic.Bool                // Flag to indicate if the queue events is closing
 	redisClient redis.Cmdable              // Redis client used to interact with the redis server
-	ctx         context.Context            // Context used to handle the queue events
 	cancel      context.CancelFunc         // Cancel function used to stop the queue events
-	Prefix      string
-	KeyPrefix   string
+	prefix      string
+	keyPrefix   string
 	mutex       sync.Mutex     // Mutex used to lock/unlock the queue events
 	wg          sync.WaitGroup // WaitGroup used to wait for the queue events to finish
-	Opts        struct {
+	opts        struct {
 		LastEventId string // Last event id
 	}
 }
 
 type QueueEventsOptions struct {
-	RedisClient redis.Cmdable // Provided working redis client
-	Autorun     bool          // If true, run the queue events immediately after creation
-	Prefix      string        // Prefix for the queue events key
+	Autorun bool   // If true, run the queue events immediately after creation
+	Prefix  string // Prefix for the queue events key
 }
 
-// NewQueueEvents creates a new QueueEvents instance
-func NewQueueEvents(ctx context.Context, name string, opts QueueEventsOptions) (*QueueEvents, error) {
-	ctx, cancel := context.WithCancel(ctx)
+// NewQueueEvents creates a new QueueEvents instance.
+// The provided ctx is used when Autorun is true; otherwise it is ignored.
+func NewQueueEvents(ctx context.Context, name string, client redis.Cmdable, opts *QueueEventsOptions) (*QueueEvents, error) {
+	if client == nil {
+		return nil, fmt.Errorf("redis client must not be nil")
+	}
+	if opts == nil {
+		opts = &QueueEventsOptions{}
+	}
 
 	qe := &QueueEvents{
-		Name:        name,
-		Token:       uuid.New(),
+		name:        name,
+		token:       uuid.New(),
 		ee:          eventemitter.NewEventEmitter(),
-		running:     false,
-		closing:     false,
-		ctx:         ctx,
-		cancel:      cancel,
-		redisClient: opts.RedisClient,
+		redisClient: client,
 	}
 
 	if opts.Prefix == "" {
-		qe.KeyPrefix = "bull"
+		qe.keyPrefix = "bull"
 	} else {
-		qe.KeyPrefix = opts.Prefix
+		qe.keyPrefix = strings.Trim(opts.Prefix, ":")
+		if qe.keyPrefix == "" {
+			return nil, fmt.Errorf("prefix cannot be empty or just colons")
+		}
 	}
-	qe.Prefix = qe.KeyPrefix
-	qe.KeyPrefix = qe.KeyPrefix + ":" + name + ":"
+	qe.prefix = qe.keyPrefix
+	qe.keyPrefix = qe.keyPrefix + ":" + name + ":"
 
-	// if autorun, run qe.run() and if it has any errors emit error event
 	if opts.Autorun {
-		err := qe.Run()
+		err := qe.Run(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("error running queue events: %v", err)
+			return nil, fmt.Errorf("error running queue events: %w", err)
 		}
 	}
 
 	return qe, nil
+}
+
+// Name returns the name of the queue
+func (qe *QueueEvents) Name() string {
+	return qe.name
 }
 
 // Emit emits the event with the given name and arguments
@@ -89,39 +87,41 @@ func (qe *QueueEvents) Emit(event string, args ...interface{}) {
 	qe.ee.Emit(event, args...)
 }
 
-// Off stops listening for the event
-func (qe *QueueEvents) Off(event string, listener func(...interface{})) {
-	qe.ee.RemoveListener(event, listener)
+// Off removes a specific listener by its ListenerID.
+func (qe *QueueEvents) Off(event string, id eventemitter.ListenerID) {
+	qe.ee.RemoveListener(event, id)
 }
 
-// On listens for the event
-func (qe *QueueEvents) On(event string, listener func(...interface{})) {
-	qe.ee.On(event, listener)
+// On listens for the event and returns a ListenerID that can be used with Off.
+func (qe *QueueEvents) On(event string, listener func(...interface{})) eventemitter.ListenerID {
+	return qe.ee.On(event, listener)
 }
 
-// Once listens for the event only once
-func (qe *QueueEvents) Once(event string, listener func(...interface{})) {
-	qe.ee.Once(event, listener)
+// Once listens for the event only once and returns a ListenerID.
+func (qe *QueueEvents) Once(event string, listener func(...interface{})) eventemitter.ListenerID {
+	return qe.ee.Once(event, listener)
 }
 
 // Run starts the queue events and listens for events from the redis stream
-func (qe *QueueEvents) Run() error {
+func (qe *QueueEvents) Run(ctx context.Context) error {
 	qe.mutex.Lock()
 	defer qe.mutex.Unlock()
 
-	if qe.running {
+	if qe.running.Load() {
 		return errors.New("queue events is already running")
 	}
 
-	qe.running = true
+	ctx, cancel := context.WithCancel(ctx)
+	qe.cancel = cancel
+	qe.running.Store(true)
 	client := qe.redisClient
 	// Set client name on provided client(s), handling both single and cluster
 	switch c := client.(type) {
 	case *redis.Client:
-		_ = c.Do(qe.ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s%s", qe.Prefix, base64.StdEncoding.EncodeToString([]byte(qe.Name)), ":qe")).Err()
+		_ = c.Do(ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s%s", qe.prefix, base64.StdEncoding.EncodeToString([]byte(qe.name)), ":qe")).Err()
 	case *redis.ClusterClient:
-		_ = c.ForEachShard(qe.ctx, func(ctx context.Context, shardClient *redis.Client) error {
-			return shardClient.Do(ctx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s%s", qe.Prefix, base64.StdEncoding.EncodeToString([]byte(qe.Name)), ":qe")).Err()
+		_ = c.ForEachShard(ctx, func(shardCtx context.Context, shardClient *redis.Client) error {
+			return shardClient.Do(shardCtx, "CLIENT", "SETNAME", fmt.Sprintf("%s:%s%s", qe.prefix, base64.StdEncoding.EncodeToString([]byte(qe.name)), ":qe")).Err()
 		})
 	}
 
@@ -129,10 +129,10 @@ func (qe *QueueEvents) Run() error {
 
 	go func() {
 		defer func() {
-			qe.running = false
+			qe.running.Store(false)
 			qe.wg.Done()
 		}()
-		if err := qe.consumeEvents(client); err != nil {
+		if err := qe.consumeEvents(ctx, client); err != nil {
 			qe.Emit("error", fmt.Sprintf("Critical error in consumeEvents: %v", err))
 			qe.cancel()
 		}
@@ -142,30 +142,38 @@ func (qe *QueueEvents) Run() error {
 }
 
 // consumeEvents consumes events from the redis stream
-func (qe *QueueEvents) consumeEvents(client redis.Cmdable) error {
-	eventKey := qe.KeyPrefix + "events"
+func (qe *QueueEvents) consumeEvents(ctx context.Context, client redis.Cmdable) error {
+	eventKey := qe.keyPrefix + "events"
 	id := "$"
-	if qe.Opts.LastEventId != "" {
-		id = qe.Opts.LastEventId
+	if qe.opts.LastEventId != "" {
+		id = qe.opts.LastEventId
 	}
 	for {
 		select {
-		case <-qe.ctx.Done():
+		case <-ctx.Done():
 			return nil
 		default:
 		}
 
-		streams, err := client.XRead(qe.ctx, &redis.XReadArgs{
+		streams, err := client.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{eventKey, id},
-			Block:   0,
+			Block:   2 * time.Second,
 		}).Result()
 
 		if err != nil {
-			if errors.Is(err, context.Canceled) {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
 			}
+			// XRead returns redis.Nil when the block timeout expires with no data.
+			if errors.Is(err, redis.Nil) {
+				continue
+			}
 			qe.Emit("error", fmt.Sprintf("Error reading from stream: %v", err))
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-time.After(500 * time.Millisecond):
+			case <-ctx.Done():
+				return nil
+			}
 			continue
 		}
 
@@ -208,7 +216,7 @@ func (qe *QueueEvents) processEvent(args map[string]interface{}, id string) erro
 		}
 		// Unmarshal the JSON data
 		if err = json.Unmarshal([]byte(dataStr), &data); err != nil {
-			return fmt.Errorf("error unmarshaling '%s': %v", dataKey, err)
+			return fmt.Errorf("error unmarshaling '%s': %w", dataKey, err)
 		}
 		args[dataKey] = data
 	}
@@ -232,16 +240,175 @@ func (qe *QueueEvents) emitEvent(eventName string, args map[string]interface{}, 
 	}
 }
 
-// Close stops the queue events
-func (qe *QueueEvents) Close() {
+// --- Typed Event Subscriptions ---
+
+// CompletedEvent represents a typed completed event from the queue stream.
+type CompletedEvent struct {
+	JobID       string
+	StreamID    string
+	ReturnValue interface{}
+}
+
+// FailedEvent represents a typed failed event from the queue stream.
+type FailedEvent struct {
+	JobID        string
+	StreamID     string
+	FailedReason string
+}
+
+// ProgressEvent represents a typed progress event from the queue stream.
+type ProgressEvent struct {
+	JobID    string
+	StreamID string
+	Data     interface{}
+}
+
+// QueueEventData represents a generic typed event from the queue stream.
+type QueueEventData struct {
+	JobID    string
+	StreamID string
+	Data     map[string]interface{}
+}
+
+// OnCompleted registers a typed callback for completed events and returns a ListenerID.
+func (qe *QueueEvents) OnCompleted(fn func(CompletedEvent)) eventemitter.ListenerID {
+	return qe.ee.On("completed", func(args ...interface{}) {
+		evt := CompletedEvent{}
+		if len(args) >= 2 {
+			if data, ok := args[0].(map[string]interface{}); ok {
+				evt.JobID, _ = data["jobId"].(string)
+				evt.ReturnValue = data["returnvalue"]
+			}
+			evt.StreamID, _ = args[1].(string)
+		}
+		fn(evt)
+	})
+}
+
+// OnFailed registers a typed callback for failed events and returns a ListenerID.
+func (qe *QueueEvents) OnFailed(fn func(FailedEvent)) eventemitter.ListenerID {
+	return qe.ee.On("failed", func(args ...interface{}) {
+		evt := FailedEvent{}
+		if len(args) >= 2 {
+			if data, ok := args[0].(map[string]interface{}); ok {
+				evt.JobID, _ = data["jobId"].(string)
+				evt.FailedReason, _ = data["failedReason"].(string)
+			}
+			evt.StreamID, _ = args[1].(string)
+		}
+		fn(evt)
+	})
+}
+
+// OnProgress registers a typed callback for progress events and returns a ListenerID.
+func (qe *QueueEvents) OnProgress(fn func(ProgressEvent)) eventemitter.ListenerID {
+	return qe.ee.On("progress", func(args ...interface{}) {
+		evt := ProgressEvent{}
+		if len(args) >= 2 {
+			if data, ok := args[0].(map[string]interface{}); ok {
+				evt.JobID, _ = data["jobId"].(string)
+				evt.Data = data["data"]
+			}
+			evt.StreamID, _ = args[1].(string)
+		}
+		fn(evt)
+	})
+}
+
+// OnActive registers a typed callback for active events and returns a ListenerID.
+func (qe *QueueEvents) OnActive(fn func(QueueEventData)) eventemitter.ListenerID {
+	return qe.ee.On("active", func(args ...interface{}) {
+		evt := QueueEventData{}
+		if len(args) >= 2 {
+			if data, ok := args[0].(map[string]interface{}); ok {
+				evt.JobID, _ = data["jobId"].(string)
+				evt.Data = data
+			}
+			evt.StreamID, _ = args[1].(string)
+		}
+		fn(evt)
+	})
+}
+
+// OnStalled registers a typed callback for stalled events and returns a ListenerID.
+func (qe *QueueEvents) OnStalled(fn func(QueueEventData)) eventemitter.ListenerID {
+	return qe.ee.On("stalled", func(args ...interface{}) {
+		evt := QueueEventData{}
+		if len(args) >= 2 {
+			if data, ok := args[0].(map[string]interface{}); ok {
+				evt.JobID, _ = data["jobId"].(string)
+				evt.Data = data
+			}
+			evt.StreamID, _ = args[1].(string)
+		}
+		fn(evt)
+	})
+}
+
+// OnDrained registers a typed callback for drained events and returns a ListenerID.
+func (qe *QueueEvents) OnDrained(fn func(streamID string)) eventemitter.ListenerID {
+	return qe.ee.On("drained", func(args ...interface{}) {
+		var streamID string
+		if len(args) >= 1 {
+			streamID, _ = args[0].(string)
+		}
+		fn(streamID)
+	})
+}
+
+// OnError registers a typed callback for error events and returns a ListenerID.
+func (qe *QueueEvents) OnError(fn func(err error)) eventemitter.ListenerID {
+	return qe.ee.On("error", func(args ...interface{}) {
+		if len(args) >= 1 {
+			switch e := args[0].(type) {
+			case error:
+				fn(e)
+			case string:
+				fn(errors.New(e))
+			default:
+				fn(fmt.Errorf("%v", e))
+			}
+		}
+	})
+}
+
+// Ping checks the connection to the Redis server.
+func (qe *QueueEvents) Ping(ctx context.Context) error {
+	_, err := qe.redisClient.Ping(ctx).Result()
+	return err
+}
+
+// Close stops the queue events with a default 5-second shutdown timeout.
+func (qe *QueueEvents) Close() error {
+	return qe.CloseWithTimeout(5 * time.Second)
+}
+
+// CloseWithTimeout stops the queue events, waiting up to timeout for graceful shutdown.
+func (qe *QueueEvents) CloseWithTimeout(timeout time.Duration) error {
 	qe.mutex.Lock()
 	defer qe.mutex.Unlock()
 
-	if !qe.running {
-		return
+	if !qe.running.Load() {
+		return nil
 	}
 
+	qe.closing.Store(true)
 	qe.cancel()
-	qe.wg.Wait()
-	qe.running = false
+
+	done := make(chan struct{})
+	go func() {
+		qe.wg.Wait()
+		close(done)
+	}()
+
+	var err error
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		err = fmt.Errorf("queue events shutdown timed out after %v", timeout)
+	}
+
+	qe.running.Store(false)
+	qe.closing.Store(false)
+	return err
 }

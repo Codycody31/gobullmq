@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,226 +15,161 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 	"go.codycody31.dev/gobullmq/internal/utils"
 	"go.codycody31.dev/gobullmq/internal/utils/repeat"
-	"go.codycody31.dev/gobullmq/types"
 
 	eventemitter "go.codycody31.dev/gobullmq/internal/eventEmitter"
 	"go.codycody31.dev/gobullmq/internal/lua"
-	"go.codycody31.dev/gobullmq/internal/redisAction"
 )
 
-// QueueIface defines the interface for a job queue with various operations.
-type QueueIface interface {
-	// EventEmitterIface is embedded to provide event handling capabilities.
-	eventemitter.EventEmitterIface
-	// Init initializes a new queue with the given context, name, and options.
-	Init(ctx context.Context, name string, opts QueueOptions) (*Queue, error)
-	// Add adds a new job to the queue with the specified name, data, and options.
-	Add(ctx context.Context, jobName string, jobData interface{}, addOpts ...AddOption) (types.Job, error)
-	// Pause pauses the queue, preventing new jobs from being processed.
-	Pause(ctx context.Context) error
-	// Resume resumes the queue, allowing jobs to be processed.
-	Resume(ctx context.Context) error
-	// IsPaused checks if the queue is currently paused.
-	IsPaused(ctx context.Context) (bool, error)
-	// Drain removes all jobs from the queue, optionally including delayed jobs.
-	Drain(delayed bool) error
-	// Clean removes completed jobs from the queue based on the specified criteria.
-	Clean(grace int, limit int, cType types.QueueEventType) ([]string, error)
-	// Obliterate completely removes the queue and its data.
-	Obliterate(opts ObliterateOpts) error
-	// Ping checks the connection to the Redis server.
-	Ping() error
-	// Remove removes a job from the queue by its ID.
-	Remove(jobId string, removeChildren bool) error
-	// TrimEvents trims the event stream to the specified maximum length.
-	TrimEvents(max int64) (int64, error)
+// Queue represents a job queue backed by Redis.
+// D is the type of data stored in jobs created by this queue.
+type Queue[D any] struct {
+	ee        *eventemitter.EventEmitter
+	name      string
+	token     uuid.UUID
+	keyPrefix string
+	client    redis.Cmdable
+	prefix    string
+	closed    atomic.Bool
+
+	streamEventsMaxLen int64
 }
 
-var _ QueueIface = (*Queue)(nil)
-
-// Queue represents a job queue with various operations.
-type Queue struct {
-	eventemitter.EventEmitter
-	Name      string
-	Token     uuid.UUID
-	KeyPrefix string
-	Client    redis.Cmdable
-	Prefix    string
-	ctx       context.Context
-}
-
-// QueueOption holds configuration options for creating a new Queue.
-// Renamed from the original QueueOption to avoid conflict with the functional option type.
+// QueueOptions holds configuration options for creating a new Queue.
 type QueueOptions struct {
-	// KeyPrefix is the prefix used for all Redis keys associated with this queue.
-	// Defaults to "bull" if empty.
-	KeyPrefix string
-
-	// StreamsEventsMaxLen is the maximum approximate length for the events stream.
-	// Defaults to 10000 if not set.
-	StreamsEventsMaxLen int64
+	Prefix             string
+	StreamEventsMaxLen int64
 }
 
-// QueueFunctionalOption defines the type for functional options used with NewQueue.
-type QueueFunctionalOption func(*QueueOptions)
-
-type QueueJob struct {
+// BulkJob defines a job for AddBulk.
+type BulkJob[D any] struct {
 	Name string
-	Data types.JobData
-	Opts types.JobOptions
+	Data D
+	Opts JobOptions
 }
 
-// NewQueue creates a new Queue instance with the specified context, name, and options.
-// It uses the functional options pattern for configuration.
-func NewQueue(ctx context.Context, name string, client redis.Cmdable, functionalOpts ...QueueFunctionalOption) (*Queue, error) {
+// QueueName returns the queue name.
+func (q *Queue[D]) QueueName() string {
+	return q.name
+}
+
+// NewQueue creates a new Queue instance.
+// The redis client is externally managed and will not be closed by the queue.
+func NewQueue[D any](name string, client redis.Cmdable, opts *QueueOptions) (*Queue[D], error) {
 	if name == "" {
 		return nil, fmt.Errorf("queue name must be provided")
 	}
-
-	// Default options
-	opts := QueueOptions{
-		KeyPrefix:           "bull",
-		StreamsEventsMaxLen: 10000, // Default maxlen
+	if client == nil {
+		return nil, fmt.Errorf("redis client must not be nil")
 	}
 
-	// Apply functional options
-	for _, fn := range functionalOpts {
-		fn(&opts)
+	prefix := "bull"
+	streamEventsMaxLen := int64(10000)
+	if opts != nil {
+		if opts.Prefix != "" {
+			prefix = strings.Trim(opts.Prefix, ":")
+			if prefix == "" {
+				return nil, fmt.Errorf("prefix cannot be empty or just colons")
+			}
+		}
+		if opts.StreamEventsMaxLen > 0 {
+			streamEventsMaxLen = opts.StreamEventsMaxLen
+		}
 	}
 
-	q := &Queue{
-		Name:   name,
-		Token:  uuid.New(),
-		ctx:    ctx,
-		Client: client,
+	q := &Queue[D]{
+		name:               name,
+		token:              uuid.New(),
+		client:             client,
+		prefix:             prefix,
+		keyPrefix:          prefix + ":" + name + ":",
+		streamEventsMaxLen: streamEventsMaxLen,
 	}
 
-	q.EventEmitter.Init()
-
-	q.KeyPrefix = opts.KeyPrefix // Use the resolved prefix
-	q.Prefix = q.KeyPrefix
-	q.KeyPrefix = q.KeyPrefix + ":" + name + ":"
-
-	// Check connection
-	if err := q.Ping(); err != nil {
-		// Consider closing the client if ping fails?
-		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
-	}
-
-	// Set stream max length
-	if _, err := q.Client.XTrimMaxLen(q.ctx, q.toKey("events"), opts.StreamsEventsMaxLen).Result(); err != nil {
-		// Log error but don't fail queue creation? Or should this be fatal?
-		q.Emit("error", fmt.Sprintf("Failed to set initial trim for events stream: %v", err))
-	}
-	// Set maxlen in meta (redundant if XTRIM works, but matches JS behaviour)
-	if _, err := q.Client.HSet(q.ctx, q.toKey("meta"), "opts.maxLenEvents", strconv.FormatInt(opts.StreamsEventsMaxLen, 10)).Result(); err != nil {
-		q.Emit("error", fmt.Sprintf("Failed to set meta opts.maxLenEvents: %v", err))
-	}
+	q.ee = eventemitter.NewEventEmitter()
 
 	return q, nil
 }
 
-// WithKeyPrefix sets the key prefix for Redis keys.
-func WithKeyPrefix(prefix string) QueueFunctionalOption {
-	return func(opts *QueueOptions) {
-		if prefix != "" {
-			opts.KeyPrefix = prefix
-		}
-	}
+// Emit emits the event with the given name and arguments.
+func (q *Queue[D]) Emit(event string, args ...interface{}) {
+	q.ee.Emit(event, args...)
 }
 
-// WithStreamsEventsMaxLen sets the max length for the events stream.
-func WithStreamsEventsMaxLen(maxLen int64) QueueFunctionalOption {
-	return func(opts *QueueOptions) {
-		if maxLen > 0 {
-			opts.StreamsEventsMaxLen = maxLen
-		}
-	}
+// On listens for the event and returns a ListenerID that can be used with Off.
+func (q *Queue[D]) On(event string, listener func(...interface{})) eventemitter.ListenerID {
+	return q.ee.On(event, listener)
 }
 
-// Init is deprecated. Provide a client via NewQueue instead.
-func (q *Queue) Init(ctx context.Context, name string, legacyOpts QueueOptions) (*Queue, error) {
-	return nil, fmt.Errorf("queue.Init is deprecated: use NewQueue(ctx, name, client, opts...) with an existing redis client")
+// Off removes a specific listener by its ListenerID.
+func (q *Queue[D]) Off(event string, id eventemitter.ListenerID) {
+	q.ee.RemoveListener(event, id)
 }
 
-// Add adds a new job to the queue with the specified name, data, and functional options.
-// jobData can be any value that is marshallable to JSON.
-func (q *Queue) Add(ctx context.Context, jobName string, jobData interface{}, addOpts ...AddOption) (types.Job, error) {
-	// Default options
-	opts := &types.JobOptions{
-		Attempts:  1, // Default attempts
-		TimeStamp: time.Now().UnixMilli(),
-		// Default RemoveOnComplete/Fail will be handled by Lua scripts if nil
+// Once listens for the event only once and returns a ListenerID.
+func (q *Queue[D]) Once(event string, listener func(...interface{})) eventemitter.ListenerID {
+	return q.ee.Once(event, listener)
+}
+
+// Add adds a new job to the queue.
+func (q *Queue[D]) Add(ctx context.Context, jobName string, data D, addOpts ...AddOption) (*Job[D], error) {
+	if q.closed.Load() {
+		return nil, ErrQueueClosed
 	}
 
-	// Apply functional options
+	opts := &JobOptions{
+		Attempts:  1,
+		Timestamp: time.Now().UnixMilli(),
+	}
+
 	for _, fn := range addOpts {
 		fn(opts)
 	}
 
-	// Validate JobId if provided
-	if opts.JobId != "" {
-		if opts.JobId == "0" || (len(opts.JobId) > 1 && opts.JobId[0] == '0' && opts.JobId[1] != ':') {
-			return types.Job{}, fmt.Errorf("jobId cannot be '0' or start with '0:' unless it's a delayed job marker")
+	if opts.JobID != "" {
+		if opts.JobID == "0" || (len(opts.JobID) > 1 && opts.JobID[0] == '0' && opts.JobID[1] != ':') {
+			return nil, fmt.Errorf("jobId cannot be '0' or start with '0:' unless it's a delayed job marker")
 		}
 	}
 
-	// Default job name
 	if jobName == "" {
 		jobName = _DEFAULT_JOB_NAME
 	}
 
-	// Marshal job data
-	jsonDataBytes, err := json.Marshal(jobData)
+	jsonDataBytes, err := json.Marshal(data)
 	if err != nil {
-		return types.Job{}, fmt.Errorf("failed to marshal jobData to JSON: %w", err)
+		return nil, fmt.Errorf("failed to marshal jobData to JSON: %w", err)
 	}
 	jsonData := string(jsonDataBytes)
 
-	// Handle repeatable jobs
 	if opts.Repeat != nil && (opts.Repeat.Every != 0 || opts.Repeat.Pattern != "") {
-		// TODO: Revisit addRepeatableJob logic to align with marshaled data and context passing
-		// For now, let's pass the marshaled data and context.
-		return q.addRepeatableJob(ctx, jobName, jsonData, *opts, true)
+		return q.addRepeatableJob(ctx, jobName, data, jsonData, *opts, true)
 	}
 
-	// Create and add standard job
-	job, err := newJob(jobName, jsonData, *opts) // Pass marshaled data
+	raw, err := newJob(jobName, jsonData, *opts)
 	if err != nil {
-		return job, fmt.Errorf("failed to create new job: %w", err)
+		return nil, fmt.Errorf("failed to create new job: %w", err)
 	}
-	jobId, err := q.addJob(ctx, job, opts.JobId) // Pass context
+	jobID, err := q.addJob(ctx, raw, opts.JobID)
 	if err != nil {
-		return job, fmt.Errorf("failed to add job: %w", err)
+		return nil, fmt.Errorf("failed to add job: %w", err)
 	}
-	job.Id = jobId
+	raw.id = jobID
+	raw.setJobContext(q.client, q.keyPrefix)
 
-	q.Emit("waiting", job)
+	q.Emit("waiting", raw)
 
-	return job, nil
+	return &Job[D]{raw: &raw, data: data}, nil
 }
 
 // pause pauses or resumes the queue based on the provided flag.
-func (q *Queue) pause(ctx context.Context, pause bool) error { // Added context
-	client := q.Client
+func (q *Queue[D]) pause(ctx context.Context, doPause bool) error {
 	p := "paused"
-
 	src := "wait"
 	dst := "paused"
-	if !pause {
+	if !doPause {
 		src = "paused"
 		dst = "wait"
 		p = "resumed"
-	}
-
-	// Use the passed context
-	exists, err := client.Exists(ctx, q.toKey(src)).Result()
-	if err != nil {
-		return fmt.Errorf("failed to check if queue exists: %w", err)
-	}
-
-	if exists == 0 {
-		return fmt.Errorf("source queue does not exist, nothing to pause or resume")
 	}
 
 	keys := []string{
@@ -243,18 +180,16 @@ func (q *Queue) pause(ctx context.Context, pause bool) error { // Added context
 		q.toKey("events"),
 	}
 
-	// Use the passed context
-	_, err = lua.Pause(client, keys, p)
+	_, err := lua.Pause(ctx, q.client, keys, p)
 	if err != nil {
 		return fmt.Errorf("failed to pause or resume queue: %w", err)
 	}
-	// fmt.Println("Result: ", rs) // Optional logging
 
 	return nil
 }
 
 // Pause pauses the queue, preventing new jobs from being processed.
-func (q *Queue) Pause(ctx context.Context) error { // Added context
+func (q *Queue[D]) Pause(ctx context.Context) error {
 	if err := q.pause(ctx, true); err != nil {
 		return fmt.Errorf("failed to pause queue: %w", err)
 	}
@@ -263,7 +198,7 @@ func (q *Queue) Pause(ctx context.Context) error { // Added context
 }
 
 // Resume resumes the queue, allowing jobs to be processed.
-func (q *Queue) Resume(ctx context.Context) error { // Added context
+func (q *Queue[D]) Resume(ctx context.Context) error {
 	if err := q.pause(ctx, false); err != nil {
 		return fmt.Errorf("failed to resume queue: %w", err)
 	}
@@ -272,46 +207,50 @@ func (q *Queue) Resume(ctx context.Context) error { // Added context
 }
 
 // IsPaused checks if the queue is currently paused.
-func (q *Queue) IsPaused(ctx context.Context) (bool, error) { // Added context and error return
-	pausedKeyExists, err := q.Client.HExists(ctx, q.KeyPrefix+"meta", "paused").Result()
-	return pausedKeyExists, err
+func (q *Queue[D]) IsPaused(ctx context.Context) (bool, error) {
+	return q.client.HExists(ctx, q.keyPrefix+"meta", "paused").Result()
 }
 
 // addJob adds a job to the queue with the specified job ID.
-func (q *Queue) addJob(ctx context.Context, job types.Job, jobId string) (string, error) { // Added context
-	rdb := q.Client
+func (q *Queue[D]) addJob(ctx context.Context, job rawJob, jobID string) (string, error) {
+	return addJobInternal(ctx, q.client, q.keyPrefix, job, jobID)
+}
 
+// addJobInternal adds a job to the queue without requiring a Queue instance.
+func addJobInternal(ctx context.Context, client redis.Cmdable, keyPrefix string, job rawJob, jobID string) (string, error) {
 	keys := []string{
-		q.KeyPrefix + "wait",
-		q.KeyPrefix + "paused",
-		q.KeyPrefix + "meta",
-		q.KeyPrefix + "id",
-		q.KeyPrefix + "delayed",
-		q.KeyPrefix + "prioritized",
-		q.KeyPrefix + "completed",
-		q.KeyPrefix + "events",
-		q.KeyPrefix + "pc",
+		keyPrefix + "wait",
+		keyPrefix + "paused",
+		keyPrefix + "meta",
+		keyPrefix + "id",
+		keyPrefix + "delayed",
+		keyPrefix + "prioritized",
+		keyPrefix + "completed",
+		keyPrefix + "events",
+		keyPrefix + "pc",
 	}
 
-	// Prepare Base arguments
 	args := []interface{}{
-		q.KeyPrefix,
-		jobId, // Can be empty, Lua handles assigning ID
-		job.Name,
-		job.TimeStamp,
-		nil, // Parent Key: Set below if Parent options exist
-		nil, // Wait Children Key: Not directly used in AddJob, managed by parent/child logic
-		nil, // Parent Dependencies Key: Not directly used in AddJob
-		nil, // Parent ID: Set below if Parent options exist
-		job.Opts.RepeatJobKey,
+		keyPrefix,
+		jobID,
+		job.name,
+		job.timestamp,
+		nil, // Parent Key
+		nil, // Wait Children Key
+		nil, // Parent Dependencies Key
+		nil, // Parent ID
+		job.opts.RepeatJobKey,
 	}
 
-	// Add parent info if available
-	if job.Opts.Parent != nil {
-		parentKey := job.Opts.Parent.Queue + ":" + job.Opts.Parent.Id // Construct parent job key
-		args[4] = parentKey                                           // parentKey
-		args[7] = job.Opts.Parent.Id                                  // parentId
-		// Note: waitChildrenKey and parentDependenciesKey are derived in Lua or other scripts
+	if job.opts.Parent != nil {
+		parentKey := job.opts.Parent.Queue + ":" + job.opts.Parent.ID
+		args[4] = parentKey
+		args[6] = parentKey + ":dependencies"
+		args[7] = job.opts.Parent.ID
+	}
+
+	if job.opts.WaitChildren {
+		args[5] = keyPrefix + "waiting-children"
 	}
 
 	msgPackedArgs, err := msgpack.Marshal(args)
@@ -319,108 +258,82 @@ func (q *Queue) addJob(ctx context.Context, job types.Job, jobId string) (string
 		return "", fmt.Errorf("failed to marshal args: %w", err)
 	}
 
-	// Marshal JobOptions using msgpack
-	// Log the options being sent to Lua
-	// fmt.Printf("--- Adding Job to Lua ---\n")
-	// fmt.Printf("Job ID Arg: %s\n", jobId)
-	// fmt.Printf("Job Name: %s\n", job.Name)
-	// fmt.Printf("Data: %s\n", job.Data)
-	// fmt.Printf("Opts: %+v\n", job.Opts)
-	// ---------------
-	msgPackedOpts, err := msgpack.Marshal(job.Opts)
+	msgPackedOpts, err := msgpack.Marshal(job.opts)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal opts: %w", err)
 	}
 
-	// Pass context to Lua script execution
-	// Use Tracef for detailed Lua call logging if needed
-	// fmt.Printf("Calling lua.AddJob with keys: %v, argsPacked: %x, data: %s, optsPacked: %x\n", keys, msgPackedArgs, job.Data, msgPackedOpts)
-	givenJobId, err := lua.AddJob(rdb, keys, msgPackedArgs, job.Data, msgPackedOpts)
+	givenJobID, err := lua.AddJob(ctx, client, keys, msgPackedArgs, job.data, msgPackedOpts)
 	if err != nil {
 		return "", fmt.Errorf("failed to add job via Lua: %w", err)
 	}
 
-	// Ensure result is string
-	finalJobId, ok := givenJobId.(string)
+	finalJobID, ok := givenJobID.(string)
 	if !ok {
-		// This shouldn't happen based on Lua script, but handle defensively
-		return "", fmt.Errorf("lua AddJob script returned unexpected type: %T", givenJobId)
+		return "", fmt.Errorf("lua AddJob script returned unexpected type: %T", givenJobID)
 	}
 
-	return finalJobId, nil
+	return finalJobID, nil
+}
+
+// toRepeatKeyOpts converts JobRepeatOptions to repeat.RepeatKeyOpts.
+func toRepeatKeyOpts(opts *JobRepeatOptions) repeat.RepeatKeyOpts {
+	return repeat.RepeatKeyOpts{
+		EndDate: opts.EndDate,
+		TZ:      opts.TZ,
+		Pattern: opts.Pattern,
+		Every:   opts.Every,
+		JobId:   opts.JobID,
+	}
 }
 
 // scheduleNextRepeatableJob calculates and schedules the next instance of a repeatable job.
-// It's intended to be called after a repeatable job instance completes successfully.
-func (q *Queue) scheduleNextRepeatableJob(ctx context.Context, name string, jsonData string, opts types.JobOptions) error {
+func (q *Queue[D]) scheduleNextRepeatableJob(ctx context.Context, name string, jsonData string, opts JobOptions) error {
+	return scheduleNextRepeatableJobInternal(ctx, q.client, q.keyPrefix, name, jsonData, opts)
+}
+
+// scheduleNextRepeatableJobInternal is a standalone function that schedules the next repeatable job
+// without requiring a Queue instance. This avoids creating throwaway Queue objects.
+func scheduleNextRepeatableJobInternal(ctx context.Context, client redis.Cmdable, keyPrefix string, name string, jsonData string, opts JobOptions) error {
 	if opts.Repeat == nil {
 		return fmt.Errorf("scheduleNextRepeatableJob called without repeat options")
 	}
 
-	// Use the *previous scheduled execution time* as the base for the next calculation,
-	// otherwise use the completed job's timestamp (opts.TimeStamp might be outdated if job was delayed significantly).
 	baseMillis := int64(opts.Repeat.PrevMillis)
 	if baseMillis == 0 {
-		// Fallback if PrevMillis isn't set (shouldn't happen after first run)
-		baseMillis = opts.TimeStamp
-		// fmt.Printf("Warning: Repeat PrevMillis was 0 for job %s, using completion timestamp %d as base\n", opts.JobId, baseMillis)
+		baseMillis = opts.Timestamp
 	}
 
-	// Calculate next execution time using the new function
-	nextMillis, err := calculateNextMillis(baseMillis, opts.Repeat) // Pass correct base time
+	nextMillis, err := calculateNextMillis(baseMillis, opts.Repeat)
 	if err != nil {
-		// Error already includes job name context from calculateNextMillis if pattern invalid
 		return fmt.Errorf("failed to calculate next repeat time: %w", err)
 	}
 
-	// Check limits and end date - calculateNextMillis handles this
 	if nextMillis == 0 {
-		// Limit reached or end date passed, do not schedule next job
-		// fmt.Printf("Repeatable job %s finished repeating.\n", opts.JobId)
-		// TODO: Optionally remove from repeat set?
-		// repeatJobKey := repeat.GetKey(name, *opts.Repeat)
-		// q.Client.ZRem(ctx, q.toKey("repeat"), repeatJobKey)
-		return nil // Not an error, just finished repeating
+		return nil
 	}
 
-	// If nextMillis is valid, schedule the job
-	repeatJobKey := repeat.GetKey(name, *opts.Repeat)
-	jobId, err := repeat.GetJobId(name, nextMillis, utils.MD5Hash(repeatJobKey), "") // Generate new ID for the *next* instance
+	repeatJobKey := repeat.GetKey(name, toRepeatKeyOpts(opts.Repeat))
+	jobID, err := repeat.GetJobId(name, nextMillis, utils.MD5Hash(repeatJobKey), "")
 	if err != nil {
 		return fmt.Errorf("failed to get next repeatable job id for %s: %w", name, err)
 	}
 
-	// Calculate delay relative to current time
 	currentUnixMillis := time.Now().UnixMilli()
 	delay := nextMillis - currentUnixMillis
 	if delay < 0 {
-		delay = 0 // Don't schedule in the past
+		delay = 0
 	}
 
-	// Prepare options for the *next* job instance
-	nextOpts := opts // Copy base options
-	nextOpts.JobId = jobId
+	nextOpts := opts
+	nextOpts.JobID = jobID
 	nextOpts.Delay = int(delay)
-	nextOpts.TimeStamp = currentUnixMillis       // Timestamp of when this scheduling happens
-	nextOpts.Repeat.PrevMillis = int(nextMillis) // Store calculated next run time
+	nextOpts.Timestamp = currentUnixMillis
+	nextOpts.Repeat.PrevMillis = int(nextMillis)
 	nextOpts.RepeatJobKey = repeatJobKey
-	nextOpts.Repeat.Count = opts.Repeat.Count + 1 // Increment count for the next instance
+	nextOpts.Repeat.Count = opts.Repeat.Count + 1
 
-	// ---- Logging ----
-	// fmt.Printf("--- Scheduling Next Repeatable Job ---\n")
-	// fmt.Printf("Previous Job ID: %s\n", opts.JobId)
-	// fmt.Printf("Job Name: %s\n", name)
-	// fmt.Printf("Repeat Key: %s\n", repeatJobKey)
-	// fmt.Printf("Base Time (ms): %d\n", baseMillis)
-	// fmt.Printf("Calculated nextMillis: %d (Time: %s)\n", nextMillis, time.UnixMilli(nextMillis))
-	// fmt.Printf("Current Time (ms): %d\n", currentUnixMillis)
-	// fmt.Printf("Calculated Delay (ms): %d\n", delay)
-	// fmt.Printf("Options for next job instance: %+v\n", nextOpts)
-	// fmt.Printf("Repeat Options for next job instance: %+v\n", nextOpts.Repeat)
-	// ---------------
-
-	// Update the repeat set in Redis
-	_, err = q.Client.ZAdd(ctx, q.toKey("repeat"), redis.Z{
+	_, err = client.ZAdd(ctx, keyPrefix+"repeat", redis.Z{
 		Score:  float64(nextMillis),
 		Member: repeatJobKey,
 	}).Result()
@@ -428,88 +341,66 @@ func (q *Queue) scheduleNextRepeatableJob(ctx context.Context, name string, json
 		return fmt.Errorf("failed to update repeat set for key %s: %w", repeatJobKey, err)
 	}
 
-	// Create the job instance with the modified opts (containing delay, instance jobId etc.)
-	job, err := newJob(name, jsonData, nextOpts) // Pass marshaled data and updated opts
+	raw, err := newJob(name, jsonData, nextOpts)
 	if err != nil {
 		return fmt.Errorf("failed to create next repeatable job instance %s: %w", name, err)
 	}
-	addedJobId, err := q.addJob(ctx, job, jobId) // Pass generated jobId
+	addedJobID, err := addJobInternal(ctx, client, keyPrefix, raw, jobID)
 	if err != nil {
 		return fmt.Errorf("failed to add next repeatable job instance %s: %w", name, err)
 	}
-	if addedJobId != jobId {
-		// fmt.Printf("Warning: Added next repeatable job ID mismatch. Expected %s, Got %s\n", jobId, addedJobId)
-		job.Id = addedJobId // Use the ID returned by Redis
+	if addedJobID != jobID {
+		raw.id = addedJobID
 	} else {
-		job.Id = jobId
+		raw.id = jobID
 	}
-
-	// Emit event for the *scheduled* job
-	q.Emit("waiting", job)
 
 	return nil
 }
 
-// calculateNextMillis calculates the next execution time in milliseconds
-// based on the repeat options and the last execution time.
-// Returns 0 if no further execution is scheduled.
-func calculateNextMillis(lastExecMillis int64, opts *types.JobRepeatOptions) (int64, error) {
+// calculateNextMillis calculates the next execution time in milliseconds.
+func calculateNextMillis(lastExecMillis int64, opts *JobRepeatOptions) (int64, error) {
 	if opts == nil {
-		return 0, nil // Not a repeat job
+		return 0, nil
 	}
 
-	// Limit
 	if opts.Limit > 0 && opts.Count >= opts.Limit {
-		return 0, nil // Limit reached
+		return 0, nil
 	}
-	// EndDate
 	nowMillis := time.Now().UnixMilli()
 	if opts.EndDate != nil && nowMillis >= opts.EndDate.UnixMilli() {
-		return 0, nil // End date passed
+		return 0, nil
 	}
 
 	var next time.Time
 	baseTime := time.UnixMilli(lastExecMillis)
 
 	if opts.Pattern != "" {
-		// Cron pattern logic
-		loc := time.UTC // Default to UTC
+		loc := time.UTC
 		if opts.TZ != "" {
 			locAttempt, err := time.LoadLocation(opts.TZ)
 			if err == nil {
 				loc = locAttempt
-			} else {
-				// Log warning: Invalid timezone, falling back to UTC
-				// fmt.Printf("Warning: Invalid timezone '%s' in repeat options, using UTC\n", opts.TZ)
 			}
 		}
-		// Use cron library with alias
 		parser := cr.NewParser(cr.Second | cr.Minute | cr.Hour | cr.Dom | cr.Month | cr.Dow)
 		sched, err := parser.Parse(opts.Pattern)
 		if err != nil {
 			return 0, fmt.Errorf("invalid cron pattern '%s': %w", opts.Pattern, err)
 		}
-		// Get next time *after* the baseTime in the specified location
 		next = sched.Next(baseTime.In(loc))
-
 	} else if opts.Every > 0 {
-		// Every interval logic
 		duration := time.Duration(opts.Every) * time.Millisecond
 		next = baseTime.Add(duration)
 	} else {
-		return 0, nil // No valid repeat definition
+		return 0, nil
 	}
 
 	if opts.StartDate != nil && next.Before(*opts.StartDate) {
-		// If next calculated time is before start date, recalculate based on start date
-		// (This might be complex for cron, might need adjustment based on desired behavior)
-		// For 'every', we can just return the start date?
 		if opts.Every > 0 {
 			next = *opts.StartDate
 		} else {
-			// Recalculating cron based on start date needs careful thought.
-			// For now, let's assume the first run after StartDate is desired.
-			baseTime = opts.StartDate.Add(-1 * time.Millisecond) // Start check just before StartDate
+			baseTime = opts.StartDate.Add(-1 * time.Millisecond)
 			loc := time.UTC
 			if opts.TZ != "" {
 				locAttempt, err := time.LoadLocation(opts.TZ)
@@ -517,68 +408,62 @@ func calculateNextMillis(lastExecMillis int64, opts *types.JobRepeatOptions) (in
 					loc = locAttempt
 				}
 			}
-			// Use alias here too
 			parser := cr.NewParser(cr.Second | cr.Minute | cr.Hour | cr.Dom | cr.Month | cr.Dow)
-			sched, _ := parser.Parse(opts.Pattern) // Ignore error, parsed above
+			sched, err := parser.Parse(opts.Pattern)
+			if err != nil {
+				return 0, fmt.Errorf("invalid cron pattern '%s': %w", opts.Pattern, err)
+			}
 			next = sched.Next(baseTime.In(loc))
 		}
 	}
 
 	if opts.EndDate != nil && next.After(*opts.EndDate) {
-		return 0, nil // Calculated next time is after end date
+		return 0, nil
 	}
 
 	if next.IsZero() {
-		return 0, nil // Calculation resulted in zero time
+		return 0, nil
 	}
 
 	return next.UnixMilli(), nil
 }
 
 // addRepeatableJob is called during the initial Queue.Add call.
-// It calculates and schedules the first instance and updates the repeat set.
-func (q *Queue) addRepeatableJob(ctx context.Context, name string, jsonData string, opts types.JobOptions, skipCheckExists bool) (types.Job, error) {
+func (q *Queue[D]) addRepeatableJob(ctx context.Context, name string, data D, jsonData string, opts JobOptions, skipCheckExists bool) (*Job[D], error) {
 	if opts.Repeat == nil {
-		return types.Job{}, fmt.Errorf("addRepeatableJob called without repeat options")
+		return nil, fmt.Errorf("addRepeatableJob called without repeat options")
 	}
 
-	// Use time.Now() or StartDate for the initial calculation base
 	initialBaseMillis := time.Now().UnixMilli()
 	if opts.Repeat.StartDate != nil && initialBaseMillis < opts.Repeat.StartDate.UnixMilli() {
 		initialBaseMillis = opts.Repeat.StartDate.UnixMilli()
 	}
 
-	// Calculate the *first* execution time
 	nextMillis, err := calculateNextMillis(initialBaseMillis, opts.Repeat)
 	if err != nil {
-		return types.Job{}, fmt.Errorf("failed to calculate initial nextMillis: %w", err)
+		return nil, fmt.Errorf("failed to calculate initial nextMillis: %w", err)
 	}
 	if nextMillis == 0 {
-		// Job doesn't repeat (e.g., limit 0 or end date passed)
-		return types.Job{}, fmt.Errorf("repeatable job will not run based on options")
+		return nil, fmt.Errorf("repeatable job will not run based on options")
 	}
 
-	repeatJobKey := repeat.GetKey(name, *opts.Repeat)
+	repeatJobKey := repeat.GetKey(name, toRepeatKeyOpts(opts.Repeat))
 
-	// Check existence ONLY if skipCheckExists is false (e.g., when updating repeat options, not implemented yet)
 	repeatableExists := true
 	if !skipCheckExists {
-		score, err := q.Client.ZScore(ctx, q.toKey("repeat"), repeatJobKey).Result()
+		score, err := q.client.ZScore(ctx, q.toKey("repeat"), repeatJobKey).Result()
 		if err != nil && err != redis.Nil {
-			return types.Job{}, fmt.Errorf("failed to check repeatable job existence: %w", err)
+			return nil, fmt.Errorf("failed to check repeatable job existence: %w", err)
 		}
 		if err == redis.Nil || score == 0 {
 			repeatableExists = false
 		}
-		// If it exists and we weren't skipping the check, maybe return an error or update?
-		// For initial add (skipCheckExists=true), we proceed regardless.
 	}
 
-	// If skipCheckExists is true (initial add) or if the job didn't exist previously
 	if skipCheckExists || !repeatableExists {
-		jobId, err := repeat.GetJobId(name, nextMillis, utils.MD5Hash(repeatJobKey), "") // Generate ID for the *first* instance
+		jobID, err := repeat.GetJobId(name, nextMillis, utils.MD5Hash(repeatJobKey), "")
 		if err != nil {
-			return types.Job{}, fmt.Errorf("failed to get initial repeatable job id: %w", err)
+			return nil, fmt.Errorf("failed to get initial repeatable job id: %w", err)
 		}
 
 		currentUnixMillis := time.Now().UnixMilli()
@@ -587,148 +472,153 @@ func (q *Queue) addRepeatableJob(ctx context.Context, name string, jsonData stri
 			delay = 0
 		}
 
-		// Prepare options for the *first* job instance
-		firstOpts := opts // Copy base options
-		firstOpts.JobId = jobId
+		firstOpts := opts
+		firstOpts.JobID = jobID
 		firstOpts.Delay = int(delay)
-		firstOpts.TimeStamp = currentUnixMillis       // Timestamp of when this initial add happens
-		firstOpts.Repeat.PrevMillis = int(nextMillis) // Store calculated next run time
+		firstOpts.Timestamp = currentUnixMillis
+		firstOpts.Repeat.PrevMillis = int(nextMillis)
 		firstOpts.RepeatJobKey = repeatJobKey
-		firstOpts.Repeat.Count = 1 // First instance
+		firstOpts.Repeat.Count = 1
 
-		// ---- Logging ----
-		// fmt.Printf("--- Adding Repeatable Job (Initial) ---\n")
-		// fmt.Printf("Job Name: %s\n", name)
-		// fmt.Printf("Repeat Key: %s\n", repeatJobKey)
-		// fmt.Printf("Base Time (ms): %d\n", initialBaseMillis)
-		// fmt.Printf("Calculated nextMillis: %d (Time: %s)\n", nextMillis, time.UnixMilli(nextMillis))
-		// fmt.Printf("Current Time (ms): %d\n", currentUnixMillis)
-		// fmt.Printf("Calculated Delay (ms): %d\n", delay)
-		// fmt.Printf("Options for first job instance: %+v\n", firstOpts) // Log the full options
-		// fmt.Printf("Repeat Options for first job instance: %+v\n", firstOpts.Repeat)
-		// ---------------
-
-		// Update the repeat set in Redis with the calculated nextMillis
-		_, err = q.Client.ZAdd(ctx, q.toKey("repeat"), redis.Z{
+		_, err = q.client.ZAdd(ctx, q.toKey("repeat"), redis.Z{
 			Score:  float64(nextMillis),
 			Member: repeatJobKey,
 		}).Result()
 		if err != nil {
-			q.Emit("error", fmt.Sprintf("Failed to add initial repeat set ZADD for key %s: %v", repeatJobKey, err))
-			// Continue trying to add the first job instance anyway?
+			return nil, fmt.Errorf("failed to add repeat set entry for key %s: %w", repeatJobKey, err)
 		}
 
-		// Create and add the first job instance
-		job, err := newJob(name, jsonData, firstOpts)
+		raw, err := newJob(name, jsonData, firstOpts)
 		if err != nil {
-			return job, fmt.Errorf("failed to create initial repeatable job instance: %w", err)
+			return nil, fmt.Errorf("failed to create initial repeatable job instance: %w", err)
 		}
-		addedJobId, err := q.addJob(ctx, job, jobId) // Pass generated jobId
+		addedJobID, err := q.addJob(ctx, raw, jobID)
 		if err != nil {
-			return job, fmt.Errorf("failed to add initial repeatable job instance: %w", err)
+			return nil, fmt.Errorf("failed to add initial repeatable job instance: %w", err)
 		}
-		if addedJobId != jobId {
-			// fmt.Printf("Warning: Added repeatable job ID mismatch. Expected %s, Got %s\n", jobId, addedJobId)
-			job.Id = addedJobId // Use the ID returned by Redis
+		if addedJobID != jobID {
+			raw.id = addedJobID
 		} else {
-			job.Id = jobId
+			raw.id = jobID
 		}
 
-		q.Emit("waiting", job) // Event for the first instance
+		q.Emit("waiting", raw)
 
-		return job, nil
-	} else {
-		// This case implies !skipCheckExists && repeatableExists, meaning we are trying to add
-		// a repeatable job that already exists in the repeat set. Handle as an error or update?
-		// For now, return an error.
-		return types.Job{}, fmt.Errorf("repeatable job with key %s already exists", repeatJobKey)
+		return &Job[D]{raw: &raw, data: data}, nil
 	}
+
+	return nil, fmt.Errorf("repeatable job with key %s already exists", repeatJobKey)
 }
 
-// Drain removes all jobs from the queue, optionally including delayed jobs.
-func (q *Queue) Drain(delayed bool) error {
+// DrainOptions configures the Drain operation.
+type DrainOptions struct {
+	IncludeDelayed bool
+}
+
+// Drain removes all jobs from the queue.
+func (q *Queue[D]) Drain(ctx context.Context, opts *DrainOptions) error {
 	keys := []string{
 		q.toKey("wait"),
 		q.toKey("paused"),
 	}
 
-	if delayed {
+	includeDelayed := false
+	if opts != nil {
+		includeDelayed = opts.IncludeDelayed
+	}
+
+	if includeDelayed {
 		keys = append(keys, q.toKey("delayed"))
 	} else {
 		keys = append(keys, "")
 	}
 	keys = append(keys, q.toKey("prioritized"))
 
-	_, err := lua.Drain(q.Client, keys, q.KeyPrefix)
+	_, err := lua.Drain(ctx, q.client, keys, q.keyPrefix)
 	if err != nil {
 		return fmt.Errorf("failed to drain queue: %w", err)
 	}
 	return nil
 }
 
-// Clean removes completed jobs from the queue based on the specified criteria.
-func (q *Queue) Clean(grace int, limit int, cType types.QueueEventType) ([]string, error) {
+// Clean removes jobs from the queue based on the specified criteria.
+func (q *Queue[D]) Clean(ctx context.Context, grace time.Duration, limit int, state JobState) ([]string, error) {
 	var jobs []string
 
-	set := cType
-	timestamp := time.Now().Unix() - int64(grace)
+	timestamp := time.Now().Unix() - int64(grace.Seconds())
 
 	keys := []string{
-		q.toKey(string(set)),
+		q.toKey(string(state)),
 		q.toKey("events"),
 	}
 
-	i, err := lua.CleanJobsInSet(q.Client, keys, q.KeyPrefix, timestamp, limit, string(set))
+	i, err := lua.CleanJobsInSet(ctx, q.client, keys, q.keyPrefix, timestamp, limit, string(state))
 	if err != nil {
 		return jobs, fmt.Errorf("failed to clean jobs: %w", err)
 	}
 
-	jobs = i.([]string)
+	if result, ok := i.([]string); ok {
+		jobs = result
+	} else if resultSlice, ok := i.([]interface{}); ok {
+		jobs = make([]string, 0, len(resultSlice))
+		for _, v := range resultSlice {
+			if s, ok := v.(string); ok {
+				jobs = append(jobs, s)
+			}
+		}
+	} else {
+		return nil, fmt.Errorf("unexpected result type from clean: %T", i)
+	}
 
-	q.Emit("cleaned", jobs, string(set))
+	q.Emit("cleaned", jobs, string(state))
 	return jobs, nil
 }
 
-type ObliterateOpts struct {
-	Force bool // Use force = true to force obliteration even with active jobs in the queue (default: false)
-	Count int  // Use count with the maximum number of deleted keys per iteration (default: 1000)
+// ObliterateOptions configures the Obliterate operation.
+type ObliterateOptions struct {
+	Force bool
+	Count int
 }
 
 // Obliterate completely removes the queue and its data.
-func (q *Queue) Obliterate(opts ObliterateOpts) error {
-	if err := q.pause(context.Background(), true); err != nil {
+func (q *Queue[D]) Obliterate(ctx context.Context, opts *ObliterateOptions) error {
+	if err := q.pause(ctx, true); err != nil {
 		return fmt.Errorf("failed to pause queue: %w", err)
 	}
 
-	var force string
-	if opts.Force {
-		force = "force"
-	}
-
-	count := opts.Count
-	if count == 0 {
-		count = 1000
+	force := ""
+	count := 1000
+	if opts != nil {
+		if opts.Force {
+			force = "force"
+		}
+		if opts.Count > 0 {
+			count = opts.Count
+		}
 	}
 
 	keys := []string{
 		q.toKey("meta"),
-		q.KeyPrefix,
+		q.keyPrefix,
 	}
 
 	for {
-		i, err := lua.Obliterate(q.Client, keys, count, force)
+		i, err := lua.Obliterate(ctx, q.client, keys, count, force)
 		if err != nil {
 			return fmt.Errorf("failed to obliterate queue: %w", err)
 		}
 
-		result := i.(int64)
+		result, ok := i.(int64)
+		if !ok {
+			return fmt.Errorf("unexpected result type from obliterate: %T", i)
+		}
 
 		if result < 0 {
 			switch result {
 			case -1:
-				return fmt.Errorf("cannot obliterate non-paused queue")
+				return ErrQueueNotPaused
 			case -2:
-				return fmt.Errorf("cannot obliterate queue with active jobs")
+				return ErrQueueHasActive
 			}
 		} else if result == 0 {
 			break
@@ -739,34 +629,57 @@ func (q *Queue) Obliterate(opts ObliterateOpts) error {
 }
 
 // Ping checks the connection to the Redis server.
-func (q *Queue) Ping() error {
-	return redisAction.Ping(q.Client)
+func (q *Queue[D]) Ping(ctx context.Context) error {
+	_, err := q.client.Ping(ctx).Result()
+	return err
 }
 
 // toKey constructs a Redis key with the queue's prefix.
-func (q *Queue) toKey(name string) string {
-	return q.KeyPrefix + name
+func (q *Queue[D]) toKey(name string) string {
+	return q.keyPrefix + name
 }
 
 // Remove removes a job from the queue by its ID.
-func (q *Queue) Remove(jobId string, removeChildren bool) error {
+func (q *Queue[D]) Remove(ctx context.Context, jobID string, removeChildren bool) error {
 	keys := []string{
-		q.KeyPrefix,
+		q.keyPrefix,
 	}
 
-	i, err := lua.RemoveJob(q.Client, keys, jobId, removeChildren)
+	i, err := lua.RemoveJob(ctx, q.client, keys, jobID, removeChildren)
 	if err != nil {
 		return fmt.Errorf("failed to remove job: %w", err)
 	}
 
-	if i.(int64) == 0 {
-		return fmt.Errorf("failed to remove job: %s, the job is locked", jobId)
+	code, ok := i.(int64)
+	if !ok {
+		return fmt.Errorf("unexpected result type from remove: %T", i)
+	}
+	if code == 0 {
+		return ErrJobLocked
 	}
 
 	return nil
 }
 
 // TrimEvents trims the event stream to the specified maximum length.
-func (q *Queue) TrimEvents(max int64) (int64, error) {
-	return q.Client.XTrimMaxLen(q.ctx, q.KeyPrefix+"events", max).Result()
+func (q *Queue[D]) TrimEvents(ctx context.Context, max int64) (int64, error) {
+	return q.client.XTrimMaxLen(ctx, q.keyPrefix+"events", max).Result()
+}
+
+// Close releases the queue's resources and prevents further operations.
+func (q *Queue[D]) Close(ctx context.Context) error {
+	q.closed.Store(true)
+	q.ee.RemoveAll()
+	return nil
+}
+
+// InitStream initializes the events stream with maxlen metadata.
+func (q *Queue[D]) InitStream(ctx context.Context) error {
+	if _, err := q.client.XTrimMaxLen(ctx, q.toKey("events"), q.streamEventsMaxLen).Result(); err != nil {
+		return fmt.Errorf("failed to set initial trim for events stream: %w", err)
+	}
+	if _, err := q.client.HSet(ctx, q.toKey("meta"), "opts.maxLenEvents", strconv.FormatInt(q.streamEventsMaxLen, 10)).Result(); err != nil {
+		return fmt.Errorf("failed to set meta opts.maxLenEvents: %w", err)
+	}
+	return nil
 }

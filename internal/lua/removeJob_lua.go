@@ -5,12 +5,11 @@ package lua
 import (
 	"context"
 	"fmt"
-
 	"github.com/redis/go-redis/v9"
 )
 
 // RemoveJob executes the Lua script removeJob on Redis with 1 keys.
-func RemoveJob(client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
+func RemoveJob(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
 	if len(keys) != 1 {
 		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
 	}
@@ -223,7 +222,7 @@ if not isLocked(prefix, ARGV[1], ARGV[2]) then
 end
 return 0
 `
-	result, err := client.Eval(context.Background(), luaScript, keys, args...).Result()
+	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

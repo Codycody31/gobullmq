@@ -4,7 +4,6 @@ go 1.20
 
 require (
 	github.com/google/uuid v1.6.0
-	github.com/gorhill/cronexpr v0.0.0-20180427100037-88b0669f7d75
 	github.com/redis/go-redis/v9 v9.12.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
