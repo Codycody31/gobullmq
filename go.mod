@@ -2,6 +2,8 @@ module go.codycody31.dev/gobullmq
 
 go 1.20
 
+retract [v1.0.0, v1.0.3] // Historical tags declare github.com/hellosekai/bull-golang and are not releases of this module.
+
 require (
 	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.12.0

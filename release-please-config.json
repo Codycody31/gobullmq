@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "ada8293237a1ec2d950aaa719dadc67984e847e9",
+  "draft-pull-request": true,
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "pull-request-header": "Release candidate for the fixed BullMQ compatibility line.",
+  "pull-request-footer": "",
+  "packages": {
+    ".": {
+      "release-type": "go",
+      "package-name": "gobullmq",
+      "initial-version": "1.1.0",
+      "versioning": "always-bump-patch"
+    }
+  }
+}

@@ -1,18 +1,111 @@
 name: CI
 
 on:
+  workflow_call:
+  workflow_dispatch:
   push:
-    branches: [ "**" ]
+    branches:
+      - main
   pull_request:
-    branches: [ "**" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      PR_BASE: ${{ github.base_ref }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.5
+
+      - name: Validate Conventional Commit title
+        run: go run ./scripts/check_pr_title.go
+
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.5
+
+      - name: Verify compatibility metadata and generated sources
+        env:
+          BRANCH_TO_VALIDATE: ${{ github.base_ref || github.ref_name }}
+        run: go run ./scripts/check_compat.go -branch "$BRANCH_TO_VALIDATE"
+
+      - name: Verify tidy module files
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+  api-compat:
+    if: github.event_name == 'pull_request' && startsWith(github.base_ref, 'release/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      APIDIFF: golang.org/x/exp/cmd/apidiff@v0.0.0-20260611194520-c48552f49976
+      MODULE: go.codycody31.dev/gobullmq
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.5
+
+      - name: Compare exported module API with PR base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git worktree add --detach /tmp/gobullmq-base "$BASE_SHA"
+          (
+            cd /tmp/gobullmq-base
+            go run "$APIDIFF" -m -w /tmp/gobullmq-base.api "$MODULE"
+          )
+          go run "$APIDIFF" -m -w /tmp/gobullmq-head.api "$MODULE"
+          go run "$APIDIFF" -m -incompatible /tmp/gobullmq-base.api /tmp/gobullmq-head.api | tee /tmp/gobullmq-apidiff.txt
+          if [[ -s /tmp/gobullmq-apidiff.txt ]]; then
+            echo "::error::incompatible exported API change on a fixed release line"
+            exit 1
+          fi
+
+  go-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - 1.20.x
+          - 1.26.5
     services:
       redis:
-        image: redis:7-alpine
+        image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
         ports:
           - 6390:6379
         options: >-
@@ -20,88 +113,138 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Setup Go ${{ matrix.go }}
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go }}
 
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Verify build
+      - name: Build
         run: go build ./...
 
       - name: Vet
         run: go vet ./...
 
-      - name: Run tests
-        run: go test -v ./...
+      - name: Test
         env:
-          REDIS_ADDR: localhost:6390
+          REDIS_ADDR: 127.0.0.1:6390
+        run: go test -count=1 ./...
 
-  # golangci-lint v2 (see .golangci.yml); action v8 is the v2-compatible major.
-  lint:
-    runs-on: ubuntu-latest
+  race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      redis:
+        image: redis:7.4-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version: stable
+          go-version: 1.26.5
+
+      - name: Race test
+        env:
+          REDIS_ADDR: 127.0.0.1:6390
+        run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.5
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v8
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: latest
+          version: v2.12.2
+          args: --timeout=5m
 
-  # The Lua layer must stay byte-identical to the pinned upstream BullMQ tag.
-  lua-drift:
-    runs-on: ubuntu-latest
+  interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - standalone
+          - cluster
     env:
-      BULLMQ_TAG: v4.12.2
+      REDIS_MODE: ${{ matrix.mode }}
+      REDIS_ADDRS: ${{ matrix.mode == 'cluster' && '127.0.0.1:7000,127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003,127.0.0.1:7004,127.0.0.1:7005' || '127.0.0.1:6390' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Checkout upstream BullMQ
-        run: git clone --depth 1 --branch "$BULLMQ_TAG" https://github.com/taskforcesh/bullmq /tmp/bullmq
-
-      - name: Diff Lua scripts against upstream
-        run: |
-          fail=0
-          for f in internal/lua/*.lua; do
-            n=$(basename "$f")
-            up="/tmp/bullmq/src/commands/$n"
-            if [ ! -f "$up" ]; then echo "::error::no upstream script for $n"; fail=1; continue; fi
-            diff -u "$up" "$f" || { echo "::error::$n drifted from upstream $BULLMQ_TAG"; fail=1; }
-          done
-          for f in internal/lua/includes/*.lua; do
-            n=$(basename "$f")
-            up="/tmp/bullmq/src/commands/includes/$n"
-            if [ ! -f "$up" ]; then echo "::error::no upstream include for $n"; fail=1; continue; fi
-            diff -u "$up" "$f" || { echo "::error::includes/$n drifted from upstream $BULLMQ_TAG"; fail=1; }
-          done
-          exit $fail
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Setup Go
-        if: success()
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
-          go-version-file: go.mod
+          go-version: 1.26.5
 
-      - name: Verify generated wrappers are in sync
+      - name: Setup Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22.23.1
+          cache: npm
+          cache-dependency-path: integration/node/package-lock.json
+
+      - name: Install Node fixture
+        working-directory: integration/node
+        run: npm ci --ignore-scripts --no-audit
+
+      - name: Start Redis
+        run: scripts/ci/redis-"$REDIS_MODE".sh up
+
+      - name: Run interoperability tests
+        run: go test -tags=interop -count=1 -v ./integration/interop
+
+      - name: Print Redis diagnostics
+        if: failure()
+        run: scripts/ci/redis-"$REDIS_MODE".sh logs
+
+      - name: Stop Redis
+        if: always()
+        run: scripts/ci/redis-"$REDIS_MODE".sh down
+
+  required:
+    if: always()
+    needs:
+      - pr-title
+      - metadata
+      - api-compat
+      - go-test
+      - race
+      - lint
+      - interop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      NEEDS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require every CI gate
         run: |
-          go run scripts/generate_lua.go
-          git diff --exit-code internal/lua/ || { echo "::error::generated *_lua.go files are stale; run go run scripts/generate_lua.go"; exit 1; }
+          set -euo pipefail
+          while read -r result; do
+            if [[ "$result" != "success" && "$result" != "skipped" ]]; then
+              echo "::error::required CI job finished with result: $result"
+              exit 1
+            fi
+          done < <(jq -r '.[].result' <<<"$NEEDS")

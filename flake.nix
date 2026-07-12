@@ -7,7 +7,7 @@
     { self, ... }@inputs:
 
     let
-      goVersion = 25; # Change this to update the whole stack
+      goVersion = 26; # Change this to update the whole stack
 
       supportedSystems = [
         "x86_64-linux"
@@ -35,7 +35,7 @@
       devShells = forEachSupportedSystem (
         { pkgs, system }:
         {
-          default = pkgs.mkShellNoCC {
+          default = pkgs.mkShell {
             packages = with pkgs; [
               # go (version is specified by overlay)
               go
@@ -45,6 +45,9 @@
 
               # https://github.com/golangci/golangci-lint
               golangci-lint
+
+              # Exact major used by the interoperability fixture.
+              nodejs_22
 
               self.formatter.${system}
             ];
