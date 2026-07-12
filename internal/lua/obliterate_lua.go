@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Obliterate executes the Lua script obliterate on Redis with 2 keys.
-func Obliterate(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 2 {
-		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// ObliterateScript is the obliterate script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var ObliterateScript = redis.NewScript(`--[[
   Completely obliterates a queue and all of its contents
   Input:
     KEYS[1] meta
@@ -467,8 +464,14 @@ if(maxCount > 0) then
 else
   return 1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// Obliterate executes the Lua script obliterate on Redis with 2 keys.
+func Obliterate(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 2 {
+		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
+	}
+	result, err := ObliterateScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

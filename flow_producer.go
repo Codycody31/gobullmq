@@ -2,27 +2,39 @@ package gobullmq
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+	"go.codycody31.dev/gobullmq/internal/lua"
 )
 
 // FlowJob defines a job within a flow (dependency tree).
 type FlowJob struct {
 	Name      string
 	QueueName string
-	Data      interface{}
+	Prefix    string // optional per-node key prefix; defaults to the producer's prefix
+	Data      any
 	Opts      JobOptions
 	Children  []FlowJob
 }
 
-// FlowJobResult represents the result of adding a flow.
+// FlowJobResult represents a node of an added or fetched flow.
 type FlowJobResult struct {
 	Job      *Job[any]
 	Children []FlowJobResult
+}
+
+// FlowGetOptions configures Flow.
+type FlowGetOptions struct {
+	ID          string
+	QueueName   string
+	Prefix      string // defaults to the producer's prefix
+	Depth       int    // how many levels of children to fetch (default 10)
+	MaxChildren int    // maximum children fetched per node (default 20)
 }
 
 // FlowProducerOptions configures the FlowProducer.
@@ -34,11 +46,11 @@ type FlowProducerOptions struct {
 type FlowProducer struct {
 	client redis.Cmdable
 	prefix string
-	mu     sync.Mutex
-	queues map[string]*Queue[any]
 }
 
 // NewFlowProducer creates a new FlowProducer instance.
+// The Redis client is externally managed: the producer holds no resources of
+// its own, so there is nothing to close.
 func NewFlowProducer(client redis.Cmdable, opts *FlowProducerOptions) (*FlowProducer, error) {
 	if client == nil {
 		return nil, fmt.Errorf("redis client must not be nil")
@@ -53,115 +65,206 @@ func NewFlowProducer(client redis.Cmdable, opts *FlowProducerOptions) (*FlowProd
 	return &FlowProducer{
 		client: client,
 		prefix: prefix,
-		queues: make(map[string]*Queue[any]),
 	}, nil
 }
 
-// Add creates a job flow (dependency tree).
+// Add creates a job flow (dependency tree). The whole tree is queued in a
+// single Redis transaction like upstream, so a partial failure cannot strand
+// a parent in waiting-children.
 func (fp *FlowProducer) Add(ctx context.Context, flow FlowJob) (*FlowJobResult, error) {
-	result, err := fp.addFlow(ctx, flow, nil)
+	results, err := fp.addFlows(ctx, []FlowJob{flow})
 	if err != nil {
 		return nil, err
 	}
-	return &result, nil
+	return results[0], nil
 }
 
-// AddBulk creates multiple job flows.
+// AddBulk creates multiple job flows atomically in a single transaction.
 func (fp *FlowProducer) AddBulk(ctx context.Context, flows []FlowJob) ([]*FlowJobResult, error) {
+	if len(flows) == 0 {
+		return nil, nil
+	}
+	return fp.addFlows(ctx, flows)
+}
+
+func (fp *FlowProducer) addFlows(ctx context.Context, flows []FlowJob) ([]*FlowJobResult, error) {
+	// Load the script up-front so the queued EVALSHAs cannot hit NOSCRIPT.
+	if err := lua.AddJobScript.Load(ctx, fp.client).Err(); err != nil {
+		return nil, fmt.Errorf("failed to load addJob script: %w", err)
+	}
+
+	pipe := fp.client.TxPipeline()
+	var pending []*redis.Cmd
 	results := make([]*FlowJobResult, 0, len(flows))
 	for _, flow := range flows {
-		result, err := fp.Add(ctx, flow)
+		result, err := fp.addNode(ctx, pipe, &pending, flow, nil)
 		if err != nil {
-			return results, err
+			return nil, err
 		}
-		results = append(results, result)
+		results = append(results, &result)
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("failed to add flow: %w", err)
+	}
+	for _, cmd := range pending {
+		v, err := cmd.Result()
+		if err != nil {
+			return nil, fmt.Errorf("failed to add flow node: %w", err)
+		}
+		if _, err := parseAddJobResult(v); err != nil {
+			return nil, err
+		}
 	}
 	return results, nil
 }
 
-// Close cleans up the FlowProducer and its cached queue instances.
-func (fp *FlowProducer) Close(ctx context.Context) error {
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
-	var errs []error
-	for _, q := range fp.queues {
-		if err := q.Close(ctx); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	fp.queues = nil
-	return errors.Join(errs...)
-}
-
-// addFlow recursively adds a flow job and its children.
-func (fp *FlowProducer) addFlow(ctx context.Context, flow FlowJob, parentOpts *ParentOpts) (FlowJobResult, error) {
-	if flow.QueueName == "" {
+// addNode queues one node (parent before its children, as upstream does) and
+// recursively its children onto the transaction.
+func (fp *FlowProducer) addNode(ctx context.Context, pipe redis.Pipeliner, pending *[]*redis.Cmd, node FlowJob, parent *ParentOptions) (FlowJobResult, error) {
+	if node.QueueName == "" {
 		return FlowJobResult{}, fmt.Errorf("flow job must have a QueueName")
 	}
+	prefix := node.Prefix
+	if prefix == "" {
+		prefix = fp.prefix
+	}
+	keyPrefix := prefix + ":" + node.QueueName + ":"
 
-	q, err := fp.getQueue(flow.QueueName)
+	opts := node.Opts
+	// Flow nodes get UUID v4 ids like upstream (jobId must be known before
+	// the transaction executes, so the INCR counter cannot be used).
+	jobID := opts.JobID
+	if jobID == "" {
+		jobID = uuid.NewString()
+	} else if jobID == "0" || strings.HasPrefix(jobID, "0:") {
+		return FlowJobResult{}, fmt.Errorf("jobId cannot be '0' or start with '0:'")
+	}
+	if parent != nil {
+		opts.Parent = parent
+	}
+	if len(node.Children) > 0 {
+		opts.WaitChildren = true
+	}
+
+	// A node without data stores "{}" like upstream (asJSON: undefined -> {}).
+	jsonData := []byte("{}")
+	if node.Data != nil {
+		var err error
+		jsonData, err = json.Marshal(node.Data)
+		if err != nil {
+			return FlowJobResult{}, fmt.Errorf("failed to marshal data for flow job %q: %w", node.Name, err)
+		}
+	}
+
+	raw, err := newJob(node.Name, string(jsonData), opts)
+	if err != nil {
+		return FlowJobResult{}, fmt.Errorf("failed to create flow job %q: %w", node.Name, err)
+	}
+
+	keys, argv, err := buildAddJobArgs(keyPrefix, raw, jobID)
 	if err != nil {
 		return FlowJobResult{}, err
 	}
+	*pending = append(*pending, lua.AddJobScript.Run(ctx, pipe, keys, argv...))
 
-	if len(flow.Children) == 0 {
-		addOpts := buildFlowAddOpts(flow.Opts, parentOpts)
-		job, err := q.Add(ctx, flow.Name, flow.Data, addOpts...)
-		if err != nil {
-			return FlowJobResult{}, fmt.Errorf("failed to add leaf flow job %q: %w", flow.Name, err)
+	raw.id = jobID
+	raw.setJobContext(fp.client, keyPrefix)
+	result := FlowJobResult{Job: &Job[any]{raw: &raw, data: node.Data}}
+
+	if len(node.Children) > 0 {
+		parentRef := &ParentOptions{
+			ID:    jobID,
+			Queue: prefix + ":" + node.QueueName,
 		}
-		return FlowJobResult{Job: job}, nil
-	}
-
-	parentFlowOpts := flow.Opts
-	parentFlowOpts.WaitChildren = true
-	addOpts := buildFlowAddOpts(parentFlowOpts, parentOpts)
-	parentJob, err := q.Add(ctx, flow.Name, flow.Data, addOpts...)
-	if err != nil {
-		return FlowJobResult{}, fmt.Errorf("failed to add parent flow job %q: %w", flow.Name, err)
-	}
-
-	parentRef := &ParentOpts{
-		ID:    parentJob.ID(),
-		Queue: fp.prefix + ":" + flow.QueueName,
-	}
-
-	childResults := make([]FlowJobResult, 0, len(flow.Children))
-	for _, child := range flow.Children {
-		childResult, err := fp.addFlow(ctx, child, parentRef)
-		if err != nil {
-			return FlowJobResult{}, fmt.Errorf("failed to add child flow job %q for parent %q: %w", child.Name, flow.Name, err)
+		result.Children = make([]FlowJobResult, 0, len(node.Children))
+		for _, child := range node.Children {
+			childResult, err := fp.addNode(ctx, pipe, pending, child, parentRef)
+			if err != nil {
+				return FlowJobResult{}, fmt.Errorf("failed to add child flow job %q for parent %q: %w", child.Name, node.Name, err)
+			}
+			result.Children = append(result.Children, childResult)
 		}
-		childResults = append(childResults, childResult)
 	}
 
-	return FlowJobResult{
-		Job:      parentJob,
-		Children: childResults,
-	}, nil
+	return result, nil
 }
 
-// buildFlowAddOpts creates AddOption slice from JobOptions and optional parent.
-func buildFlowAddOpts(opts JobOptions, parentOpts *ParentOpts) []AddOption {
-	addOpts := optsToAddOptions(opts)
-	if parentOpts != nil {
-		addOpts = append(addOpts, AddWithParent(*parentOpts))
+// Flow fetches a flow tree rooted at the given job, following processed
+// and unprocessed dependencies, mirroring upstream FlowProducer.getFlow.
+func (fp *FlowProducer) Flow(ctx context.Context, opts FlowGetOptions) (*FlowJobResult, error) {
+	prefix := opts.Prefix
+	if prefix == "" {
+		prefix = fp.prefix
 	}
-	return addOpts
+	depth := opts.Depth
+	if depth <= 0 {
+		depth = 10
+	}
+	maxChildren := opts.MaxChildren
+	if maxChildren <= 0 {
+		maxChildren = 20
+	}
+	return fp.getNode(ctx, prefix, opts.QueueName, opts.ID, depth, maxChildren)
 }
 
-// getQueue returns a cached Queue instance for the given name.
-func (fp *FlowProducer) getQueue(name string) (*Queue[any], error) {
-	fp.mu.Lock()
-	defer fp.mu.Unlock()
-
-	if q, ok := fp.queues[name]; ok {
-		return q, nil
-	}
-	q, err := NewQueue[any](name, fp.client, &QueueOptions{Prefix: fp.prefix})
+func (fp *FlowProducer) getNode(ctx context.Context, prefix, queueName, jobId string, depth, maxChildren int) (*FlowJobResult, error) {
+	keyPrefix := prefix + ":" + queueName + ":"
+	raw, err := jobFromId(ctx, fp.client, keyPrefix, jobId)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create queue %q for flow: %w", name, err)
+		if errors.Is(err, ErrJobNotFound) {
+			return nil, nil
+		}
+		return nil, err
 	}
-	fp.queues[name] = q
-	return q, nil
+	raw.setJobContext(fp.client, keyPrefix)
+	typed, err := wrapRawJob[any](&raw)
+	if err != nil {
+		return nil, err
+	}
+	node := &FlowJobResult{Job: typed}
+
+	if depth > 1 {
+		jobKey := keyPrefix + jobId
+		pipe := fp.client.Pipeline()
+		processedCmd := pipe.HKeys(ctx, jobKey+":processed")
+		unprocessedCmd := pipe.SMembers(ctx, jobKey+":dependencies")
+		if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+			return nil, err
+		}
+		// maxChildren caps each dependency type separately, like upstream's
+		// per-type counts in getDependencies.
+		processed := processedCmd.Val()
+		if len(processed) > maxChildren {
+			processed = processed[:maxChildren]
+		}
+		unprocessed := unprocessedCmd.Val()
+		if len(unprocessed) > maxChildren {
+			unprocessed = unprocessed[:maxChildren]
+		}
+		childKeys := append(processed, unprocessed...)
+		for _, childKey := range childKeys {
+			// childKey is "<prefix>:<queueName>:<id>".
+			lastColon := strings.LastIndex(childKey, ":")
+			if lastColon < 0 {
+				continue
+			}
+			childID := childKey[lastColon+1:]
+			rest := childKey[:lastColon]
+			midColon := strings.LastIndex(rest, ":")
+			if midColon < 0 {
+				continue
+			}
+			childQueue := rest[midColon+1:]
+			childPrefix := rest[:midColon]
+			child, err := fp.getNode(ctx, childPrefix, childQueue, childID, depth-1, maxChildren)
+			if err != nil {
+				return nil, err
+			}
+			if child != nil {
+				node.Children = append(node.Children, *child)
+			}
+		}
+	}
+	return node, nil
 }

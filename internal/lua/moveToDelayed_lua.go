@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// MoveToDelayed executes the Lua script moveToDelayed on Redis with 8 keys.
-func MoveToDelayed(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 8 {
-		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// MoveToDelayedScript is the moveToDelayed script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var MoveToDelayedScript = redis.NewScript(`--[[
   Moves job from active to delayed set.
   Input:
     KEYS[1] wait key
@@ -158,8 +155,14 @@ if rcall("EXISTS", jobKey) == 1 then
 else
   return -1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// MoveToDelayed executes the Lua script moveToDelayed on Redis with 8 keys.
+func MoveToDelayed(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 8 {
+		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
+	}
+	result, err := MoveToDelayedScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

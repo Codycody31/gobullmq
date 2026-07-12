@@ -7,7 +7,7 @@ type ListenerID uint64
 
 type listener struct {
 	id   ListenerID
-	fn   func(...interface{})
+	fn   func(...any)
 	once bool
 }
 
@@ -23,7 +23,7 @@ func NewEventEmitter() *EventEmitter {
 	}
 }
 
-func (e *EventEmitter) On(event string, fn func(...interface{})) ListenerID {
+func (e *EventEmitter) On(event string, fn func(...any)) ListenerID {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.nextID++
@@ -32,7 +32,7 @@ func (e *EventEmitter) On(event string, fn func(...interface{})) ListenerID {
 	return id
 }
 
-func (e *EventEmitter) Once(event string, fn func(...interface{})) ListenerID {
+func (e *EventEmitter) Once(event string, fn func(...any)) ListenerID {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.nextID++
@@ -73,7 +73,7 @@ func (e *EventEmitter) RemoveAll() {
 	e.listeners = make(map[string][]listener)
 }
 
-func (e *EventEmitter) Emit(event string, args ...interface{}) {
+func (e *EventEmitter) Emit(event string, args ...any) {
 	e.mu.Lock()
 	ls, ok := e.listeners[event]
 	if !ok || len(ls) == 0 {
@@ -85,7 +85,7 @@ func (e *EventEmitter) Emit(event string, args ...interface{}) {
 	// remaining uses ls[:0] which shares the backing array, but this is safe
 	// because remaining always trails behind or equals the loop index i,
 	// so we never overwrite an element that hasn't been read yet.
-	toCall := make([]func(...interface{}), len(ls))
+	toCall := make([]func(...any), len(ls))
 	remaining := ls[:0]
 	for i, l := range ls {
 		toCall[i] = l.fn

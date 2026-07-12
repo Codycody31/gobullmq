@@ -1,6 +1,7 @@
 package backoff
 
 import (
+	"fmt"
 	"math"
 )
 
@@ -10,51 +11,31 @@ type Options struct {
 	Delay int    `json:"delay" msgpack:"delay"`
 }
 
-// Strategy is a function that returns a delay in milliseconds based on attemptsMade.
-type Strategy func(attemptsMade int, backoffType string) int
-
-// Built-in strategies mapped by name.
-var builtinStrategies = map[string]func(delay int) Strategy{
-	"fixed": func(delay int) Strategy {
-		return func(_ int, _ string) int {
-			return max(0, delay)
-		}
-	},
-	"exponential": func(delay int) Strategy {
-		return func(attemptsMade int, _ string) int {
-			if attemptsMade <= 0 {
-				attemptsMade = 1
-			}
-			const maxBackoffMs = 86_400_000 // 24 hours
-			factor := math.Pow(2, float64(attemptsMade-1))
-			d := int(math.Round(factor * float64(delay)))
-			if d < 0 || d > maxBackoffMs {
-				d = maxBackoffMs
-			}
-			return d
-		}
-	},
+// IsBuiltin reports whether the type is handled by Calculate ("" means no
+// backoff). Non-builtin types are routed to custom strategies, mirroring
+// upstream lookupStrategy's precedence.
+func IsBuiltin(backoffType string) bool {
+	switch backoffType {
+	case "", "fixed", "exponential":
+		return true
+	}
+	return false
 }
 
-// Calculate computes the backoff delay in milliseconds for the given options and attemptsMade.
-// Returning 0 means retry immediately. Returning a positive value schedules a delayed retry.
-// Returning -1 can be used by custom strategies to signal "do not retry".
-func Calculate(opts Options, attemptsMade int) int {
-	if opts.Type == "" {
-		return 0
+// Calculate computes the backoff delay in milliseconds, mirroring upstream
+// Backoffs.calculate. Returning 0 means retry immediately; a positive value
+// schedules a delayed retry. An unknown strategy name is an error, matching
+// upstream's "Unknown backoff strategy" throw.
+func Calculate(opts Options, attemptsMade int) (int, error) {
+	switch opts.Type {
+	case "":
+		// No backoff configured: retry immediately.
+		return 0, nil
+	case "fixed":
+		return opts.Delay, nil
+	case "exponential":
+		return int(math.Round(math.Pow(2, float64(attemptsMade-1)) * float64(opts.Delay))), nil
+	default:
+		return 0, fmt.Errorf("unknown backoff strategy %s. If a custom backoff strategy is used, specify it via WorkerOptions.BackoffStrategy", opts.Type)
 	}
-	factory, ok := builtinStrategies[opts.Type]
-	if !ok {
-		// Unknown strategy -> default to immediate retry
-		return 0
-	}
-	strategy := factory(opts.Delay)
-	return strategy(attemptsMade, opts.Type)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

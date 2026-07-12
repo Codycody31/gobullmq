@@ -35,6 +35,10 @@ generate: generate-lua ## Run all code generations
 generate-lua: ## Generate Lua bindings
 	go run ./scripts/generate_lua.go
 
+.PHONY: lint
+lint: ## Lint the code with golangci-lint
+	golangci-lint run
+
 .PHONY: test
 test: ## Run tests
 	go test -v ./...

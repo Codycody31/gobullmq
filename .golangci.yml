@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - misspell
+    - revive
+    - staticcheck
+  exclusions:
+    generated: lax
+    paths:
+      # Generated Lua wrappers (make generate-lua).
+      - internal/lua/.*_lua\.go$
+    rules:
+      # The wire-frozen public API and upstream-mirroring code use BullMQ's
+      # names (jobId, LastEventId, ...); renaming is not worth the churn.
+      - linters: [revive]
+        text: "^var-naming:"
+      # Internal packages and the runnable example keep their existing shape;
+      # they are not part of the documented API surface.
+      - path: ^(internal|examples)/
+        linters: [revive]
+      # Tests ignore cleanup errors deliberately, and example/processor
+      # callbacks must keep their ctx parameter to match ProcessFunc.
+      - path: _test\.go$
+        linters: [errcheck]
+      - path: _test\.go$
+        linters: [revive]
+        text: "^unused-parameter:"

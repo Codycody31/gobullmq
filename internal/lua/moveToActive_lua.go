@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// MoveToActive executes the Lua script moveToActive on Redis with 10 keys.
-func MoveToActive(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 10 {
-		return nil, fmt.Errorf("expected 10 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// MoveToActiveScript is the moveToActive script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var MoveToActiveScript = redis.NewScript(`--[[
   Move next job to be processed to active, lock it and fetch its data. The job
   may be delayed, in that case we need to move it to the delayed set instead.
   This operation guarantees that the worker owns the job during the lock
@@ -256,8 +253,14 @@ end
 local nextTimestamp = getNextDelayedTimestamp(delayedKey)
 if (nextTimestamp ~= nil) then return {0, 0, 0, nextTimestamp} end
 return {0, 0, 0, 0}
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// MoveToActive executes the Lua script moveToActive on Redis with 10 keys.
+func MoveToActive(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 10 {
+		return nil, fmt.Errorf("expected 10 keys but got %d", len(keys))
+	}
+	result, err := MoveToActiveScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// GetRanges executes the Lua script getRanges on Redis with 1 keys.
-func GetRanges(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 1 {
-		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// GetRangesScript is the getRanges script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var GetRangesScript = redis.NewScript(`--[[
   Get job ids per provided states
     Input:
       KEYS[1]    'prefix'
@@ -75,8 +72,14 @@ for i = 4, #ARGV do
   end
 end
 return results
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// GetRanges executes the Lua script getRanges on Redis with 1 keys.
+func GetRanges(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 1 {
+		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
+	}
+	result, err := GetRangesScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

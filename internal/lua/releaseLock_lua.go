@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ReleaseLock executes the Lua script releaseLock on Redis with 1 keys.
-func ReleaseLock(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 1 {
-		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// ReleaseLockScript is the releaseLock script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var ReleaseLockScript = redis.NewScript(`--[[
   Release lock
     Input:
       KEYS[1] 'lock',
@@ -28,8 +25,14 @@ if rcall("GET", KEYS[1]) == ARGV[1] then
 else
   return 0
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// ReleaseLock executes the Lua script releaseLock on Redis with 1 keys.
+func ReleaseLock(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 1 {
+		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
+	}
+	result, err := ReleaseLockScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

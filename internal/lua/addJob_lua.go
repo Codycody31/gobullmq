@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// AddJob executes the Lua script addJob on Redis with 9 keys.
-func AddJob(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 9 {
-		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// AddJobScript is the addJob script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var AddJobScript = redis.NewScript(`--[[
   Adds a job to the queue by doing the following:
     - Increases the job counter if needed.
     - Creates a new job key with the job data.
@@ -338,8 +335,14 @@ if parentDependenciesKey ~= nil then
   rcall("SADD", parentDependenciesKey, jobIdKey)
 end
 return jobId .. "" -- convert to string
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// AddJob executes the Lua script addJob on Redis with 9 keys.
+func AddJob(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 9 {
+		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
+	}
+	result, err := AddJobScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

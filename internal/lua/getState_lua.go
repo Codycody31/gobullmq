@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// GetState executes the Lua script getState on Redis with 8 keys.
-func GetState(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 8 {
-		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// GetStateScript is the getState script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var GetStateScript = redis.NewScript(`--[[
   Get a job state
   Input: 
     KEYS[1] 'completed' key,
@@ -76,8 +73,14 @@ if rcall("ZSCORE", KEYS[7], ARGV[1]) ~= false then
   return "waiting-children"
 end
 return "unknown"
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// GetState executes the Lua script getState on Redis with 8 keys.
+func GetState(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 8 {
+		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
+	}
+	result, err := GetStateScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

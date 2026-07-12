@@ -153,14 +153,16 @@ func main() {
 	// Wait for shutdown signal (ctx will be cancelled by signal.NotifyContext)
 	worker.Wait()
 
-	// Clean up
-	if err := worker.Close(); err != nil {
-		fmt.Println("Error closing worker:", err)
+	// Clean up: shut the worker down gracefully, bounded by a timeout.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := worker.Shutdown(shutdownCtx); err != nil {
+		fmt.Println("Error shutting down worker:", err)
 	}
 	if err := events.Close(); err != nil {
 		fmt.Println("Error closing events:", err)
 	}
-	if err := queue.Close(ctx); err != nil {
+	if err := queue.Close(); err != nil {
 		fmt.Println("Error closing queue:", err)
 	}
 }

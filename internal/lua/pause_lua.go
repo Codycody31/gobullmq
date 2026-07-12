@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Pause executes the Lua script pause on Redis with 5 keys.
-func Pause(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 5 {
-		return nil, fmt.Errorf("expected 5 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// PauseScript is the pause script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var PauseScript = redis.NewScript(`--[[
   Pauses or resumes a queue globably.
   Input:
     KEYS[1] 'wait' or 'paused''
@@ -51,8 +48,14 @@ else
   end
 end
 rcall("XADD", KEYS[5], "*", "event", ARGV[1]);
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// Pause executes the Lua script pause on Redis with 5 keys.
+func Pause(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 5 {
+		return nil, fmt.Errorf("expected 5 keys but got %d", len(keys))
+	}
+	result, err := PauseScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

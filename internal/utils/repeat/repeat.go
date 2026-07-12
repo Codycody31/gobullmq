@@ -3,43 +3,46 @@ package repeat
 import (
 	"fmt"
 	"strconv"
-	"time"
 
 	"go.codycody31.dev/gobullmq/internal/utils"
 )
 
-// GetJobId returns the job id
-func GetJobId(name string, nextMillis int64, namespace string, jobId string) (string, error) {
+// GetJobId builds a repeatable job instance id, byte-compatible with
+// upstream getRepeatJobId: md5(name + jobId + namespace) with no separators.
+// nextMillis is a string so removal paths can pass "" (yielding the id prefix).
+func GetJobId(name string, nextMillis string, namespace string, jobId string) string {
+	checksum := utils.MD5Hash(name + jobId + namespace)
+	return fmt.Sprintf("repeat:%s:%s", checksum, nextMillis)
+}
+
+// GetLegacyJobId builds the instance id used by pre-redesign Go releases.
+// It is retained only for removing delayed iterations that survive an upgrade.
+func GetLegacyJobId(name string, nextMillis string, namespace string, jobId string) string {
 	checksum := utils.MD5Hash(fmt.Sprintf("%s:%s:%s", name, jobId, namespace))
-	return fmt.Sprintf("repeat:%s:%s", checksum, strconv.FormatInt(nextMillis, 10)), nil
+	return fmt.Sprintf("repeat:%s:%s", checksum, nextMillis)
 }
 
 // RepeatKeyOpts holds the fields needed to build a repeat key.
 type RepeatKeyOpts struct {
-	EndDate *time.Time
+	EndDate int64 // Unix epoch milliseconds, 0 when unset
 	TZ      string
 	Pattern string
 	Every   int
 	JobId   string
 }
 
-// GetKey returns the key for the repeatable job
+// GetKey returns the key for the repeatable job, byte-compatible with
+// upstream getRepeatKey: name:jobId:endDate:tz:suffix.
 func GetKey(name string, opts RepeatKeyOpts) string {
-	var endDate string
-	if opts.EndDate != nil {
-		endDate = strconv.FormatInt(opts.EndDate.UnixNano()/int64(time.Millisecond), 10)
-	} else {
-		endDate = ""
+	endDate := ""
+	if opts.EndDate != 0 {
+		endDate = strconv.FormatInt(opts.EndDate, 10)
 	}
 
-	tz := opts.TZ
-	pattern := opts.Pattern
-	suffix := pattern
+	suffix := opts.Pattern
 	if suffix == "" {
 		suffix = strconv.Itoa(opts.Every)
 	}
 
-	jobId := opts.JobId
-
-	return fmt.Sprintf("%s:%s:%s:%s:%s", name, jobId, endDate, tz, suffix)
+	return fmt.Sprintf("%s:%s:%s:%s:%s", name, opts.JobId, endDate, opts.TZ, suffix)
 }

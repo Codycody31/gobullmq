@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// UpdateData executes the Lua script updateData on Redis with 1 keys.
-func UpdateData(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 1 {
-		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// UpdateDataScript is the updateData script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var UpdateDataScript = redis.NewScript(`--[[
   Update job data
   Input:
     KEYS[1] Job id key
@@ -29,8 +26,14 @@ if rcall("EXISTS",KEYS[1]) == 1 then -- // Make sure job exists
 else
   return -1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// UpdateData executes the Lua script updateData on Redis with 1 keys.
+func UpdateData(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 1 {
+		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
+	}
+	result, err := UpdateDataScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

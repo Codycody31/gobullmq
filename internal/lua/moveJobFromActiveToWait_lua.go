@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// MoveJobFromActiveToWait executes the Lua script moveJobFromActiveToWait on Redis with 9 keys.
-func MoveJobFromActiveToWait(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 9 {
-		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// MoveJobFromActiveToWaitScript is the moveJobFromActiveToWait script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var MoveJobFromActiveToWaitScript = redis.NewScript(`--[[
   Function to move job from active state to wait.
   Input:
     KEYS[1] active key
@@ -73,8 +70,14 @@ if lockToken == token and pttl > 0 then
   end
 end
 return pttl
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// MoveJobFromActiveToWait executes the Lua script moveJobFromActiveToWait on Redis with 9 keys.
+func MoveJobFromActiveToWait(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 9 {
+		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
+	}
+	result, err := MoveJobFromActiveToWaitScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

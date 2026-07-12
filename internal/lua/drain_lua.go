@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Drain executes the Lua script drain on Redis with 4 keys.
-func Drain(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 4 {
-		return nil, fmt.Errorf("expected 4 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// DrainScript is the drain script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var DrainScript = redis.NewScript(`--[[
   Drains the queue, removes all jobs that are waiting
   or delayed, but not active, completed or failed
   Input:
@@ -293,8 +290,14 @@ if KEYS[3] ~= "" then
   removeZSetJobs(KEYS[3], true, queueBaseKey, 0) --delayed
 end
 removeZSetJobs(KEYS[4], true, queueBaseKey, 0) --prioritized
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// Drain executes the Lua script drain on Redis with 4 keys.
+func Drain(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 4 {
+		return nil, fmt.Errorf("expected 4 keys but got %d", len(keys))
+	}
+	result, err := DrainScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

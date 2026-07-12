@@ -15,6 +15,12 @@ import (
 type scripts struct {
 	redisClient redis.Cmdable
 	keyPrefix   string
+	// Worker-level options consulted by moveToFinished, mirroring upstream
+	// where these live on queue.opts: the limiter for the fetch-next path,
+	// and the fallback keep policies when the job itself has none.
+	limiter          *RateLimiterOptions
+	removeOnComplete *KeepJobs
+	removeOnFail     *KeepJobs
 }
 
 func newScripts(redisClient redis.Cmdable, keyPrefix string) *scripts {
@@ -24,39 +30,25 @@ func newScripts(redisClient redis.Cmdable, keyPrefix string) *scripts {
 	}
 }
 
-func (s *scripts) moveToFailedArgs(job *rawJob, failedReason string, removeOnFailed KeepJobs, token string, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []interface{}, error) {
+func (s *scripts) moveToFailedArgs(job *rawJob, failedReason string, removeOnFailed *KeepJobs, token string, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []any, error) {
 	timestamp := time.Now()
 	return s.moveToFinishedArgs(job, failedReason, "failedReason", removeOnFailed, "failed", token, timestamp, fetchNext, lockDurationMs, maxMetricsSize)
 }
 
-// getKeepJobs determines the job retention policy based on provided parameters
-func (s *scripts) getKeepJobs(shouldRemove interface{}, workerKeepJobs *KeepJobs) KeepJobs {
-	// If shouldRemove is nil/undefined, use workerKeepJobs or default
-	if shouldRemove == nil {
-		if workerKeepJobs != nil {
-			return *workerKeepJobs
-		}
-		return KeepJobs{Count: -1} // keep all
+// getKeepJobs resolves the retention policy: job-level opts win, then the
+// worker-level default, then keep-all, mirroring upstream getKeepJobs.
+func (s *scripts) getKeepJobs(shouldRemove *KeepJobs, workerKeepJobs *KeepJobs) KeepJobs {
+	if shouldRemove != nil {
+		return *shouldRemove
 	}
-
-	// Handle different types of shouldRemove
-	switch v := shouldRemove.(type) {
-	case KeepJobs:
-		return v
-	case int:
-		return KeepJobs{Count: v}
-	case bool:
-		if v {
-			return KeepJobs{Count: 0} // Remove all (keep none)
-		}
-		return KeepJobs{Count: -1} // Keep all
-	default:
-		return KeepJobs{Count: -1} // Keep all
+	if workerKeepJobs != nil {
+		return *workerKeepJobs
 	}
+	return KeepJobs{Count: -1} // keep all
 }
 
-func (s *scripts) moveToFinishedArgs(job *rawJob, value string, propValue string, shouldRemove interface{}, target string, token string, timestamp time.Time, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []interface{}, error) {
-	// Build the keys array - equivalent to moveToFinishedKeys in JS
+func (s *scripts) moveToFinishedArgs(job *rawJob, value string, propValue string, shouldRemove *KeepJobs, target string, token string, timestamp time.Time, fetchNext bool, lockDurationMs int, maxMetricsSize string) ([]string, []any, error) {
+	// Keys mirror upstream moveToFinishedKeys (scripts.ts).
 	keys := []string{
 		s.keyPrefix + "wait",
 		s.keyPrefix + "active",
@@ -73,8 +65,8 @@ func (s *scripts) moveToFinishedArgs(job *rawJob, value string, propValue string
 		s.keyPrefix + "metrics:" + target,
 	}
 
-	// Convert job data to JSON string for the event
-	eventData, err := json.Marshal(map[string]interface{}{
+	// Event payload for ARGV[6], like upstream JSON.stringify({jobId, val}).
+	eventData, err := json.Marshal(map[string]any{
 		"jobId": job.id,
 		"val":   value,
 	})
@@ -83,41 +75,34 @@ func (s *scripts) moveToFinishedArgs(job *rawJob, value string, propValue string
 	}
 	var workerKeepJobs *KeepJobs
 	if target == "completed" {
-		workerKeepJobs = job.opts.RemoveOnComplete
+		workerKeepJobs = s.removeOnComplete
 	} else {
-		workerKeepJobs = job.opts.RemoveOnFail
+		workerKeepJobs = s.removeOnFail
 	}
-	var keepJobs = s.getKeepJobs(shouldRemove, workerKeepJobs)
-	var payload map[string]interface{}
-	payload = map[string]interface{}{
-		"age":   keepJobs.Age,
-		"count": keepJobs.Count,
-	}
-	if keepJobs.Age == 0 {
-		payload = map[string]interface{}{
-			"count": keepJobs.Count,
-		}
-	}
+	keepJobs := s.getKeepJobs(shouldRemove, workerKeepJobs)
 
-	opts := map[string]interface{}{
+	opts := map[string]any{
 		"token":          token,
-		"keepJobs":       payload,
+		"keepJobs":       keepJobs,
 		"lockDuration":   lockDurationMs,
 		"attempts":       job.opts.Attempts,
 		"attemptsMade":   job.attemptsMade,
 		"maxMetricsSize": maxMetricsSize,
 		"fpof":           job.opts.FailParentOnFailure,
 		"rdof":           job.opts.RemoveDependencyOnFailure,
-		"parentKey":      job.parentKey,
 	}
-	// Pack options using msgpack
+	if s.limiter != nil {
+		opts["limiter"] = map[string]any{
+			"max":      s.limiter.Max,
+			"duration": s.limiter.Duration,
+		}
+	}
 	packedOpts, err := msgpack.Marshal(opts)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal options: %w", err)
 	}
 
-	// Build the args array
-	args := []interface{}{
+	args := []any{
 		job.id,
 		timestamp.UnixMilli(),
 		propValue,
@@ -133,7 +118,7 @@ func (s *scripts) moveToFinishedArgs(job *rawJob, value string, propValue string
 }
 
 // retryJobArgs builds the keys and args for the retryJob Lua script call.
-func (s *scripts) retryJobArgs(jobId string, lifo bool, token string) ([]string, []interface{}) {
+func (s *scripts) retryJobArgs(jobId string, lifo bool, token string) ([]string, []any) {
 	keys := []string{
 		s.keyPrefix + "active",
 		s.keyPrefix + "wait",
@@ -151,7 +136,7 @@ func (s *scripts) retryJobArgs(jobId string, lifo bool, token string) ([]string,
 		pushCmd = "RPUSH"
 	}
 
-	args := []interface{}{
+	args := []any{
 		s.keyPrefix,
 		time.Now().UnixMilli(),
 		pushCmd,
@@ -164,7 +149,7 @@ func (s *scripts) retryJobArgs(jobId string, lifo bool, token string) ([]string,
 
 // moveToDelayedArgs builds the keys and args for the moveToDelayed Lua script call.
 // timestampMillis represents when the job should be retried (in ms).
-func (s *scripts) moveToDelayedArgs(jobId string, timestampMillis int64, token string) ([]string, []interface{}) {
+func (s *scripts) moveToDelayedArgs(jobId string, timestampMillis int64, token string) ([]string, []any) {
 	// Normalize timestamp and bake in job id lower 12 bits like BullMQ
 	if timestampMillis < 0 {
 		timestampMillis = 0
@@ -193,7 +178,7 @@ func (s *scripts) moveToDelayedArgs(jobId string, timestampMillis int64, token s
 		s.keyPrefix + "meta",
 	}
 
-	args := []interface{}{
+	args := []any{
 		s.keyPrefix,
 		time.Now().UnixMilli(),
 		fmt.Sprintf("%d", score),
@@ -205,10 +190,10 @@ func (s *scripts) moveToDelayedArgs(jobId string, timestampMillis int64, token s
 }
 
 // updateProgress updates the progress of a job.
-func (s *scripts) updateProgress(ctx context.Context, jobId string, progress interface{}) error {
+func (s *scripts) updateProgress(ctx context.Context, jobId string, progress any) error {
 	keys := []string{
 		s.keyPrefix + jobId,
-		s.keyPrefix + jobId + ":events",
+		s.keyPrefix + "events",
 	}
 
 	progressJson, err := json.Marshal(progress)
@@ -234,7 +219,7 @@ func (s *scripts) updateProgress(ctx context.Context, jobId string, progress int
 }
 
 // updateData updates the job's data field atomically in Redis.
-func (s *scripts) updateData(ctx context.Context, jobId string, data interface{}) error {
+func (s *scripts) updateData(ctx context.Context, jobId string, data any) error {
 	keys := []string{
 		s.keyPrefix + jobId,
 	}
@@ -273,7 +258,7 @@ func (s *scripts) moveJobFromActiveToWait(ctx context.Context, jobId string, tok
 		s.keyPrefix + "events",
 	}
 
-	args := []interface{}{
+	args := []any{
 		jobId,
 		token,
 		s.keyPrefix + jobId,

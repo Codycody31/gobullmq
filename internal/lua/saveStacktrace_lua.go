@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// SaveStacktrace executes the Lua script saveStacktrace on Redis with 1 keys.
-func SaveStacktrace(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 1 {
-		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// SaveStacktraceScript is the saveStacktrace script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var SaveStacktraceScript = redis.NewScript(`--[[
   Save stacktrace and failedReason.
   Input:
     KEYS[1] job key
@@ -30,8 +27,14 @@ if rcall("EXISTS", KEYS[1]) == 1 then
 else
   return -1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// SaveStacktrace executes the Lua script saveStacktrace on Redis with 1 keys.
+func SaveStacktrace(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 1 {
+		return nil, fmt.Errorf("expected 1 keys but got %d", len(keys))
+	}
+	result, err := SaveStacktraceScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

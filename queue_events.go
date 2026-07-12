@@ -17,26 +17,30 @@ import (
 	eventemitter "go.codycody31.dev/gobullmq/internal/eventEmitter"
 )
 
+// QueueEvents consumes a queue's Redis event stream and re-emits every entry
+// as an in-process event, so any process can observe job lifecycle globally.
 type QueueEvents struct {
-	name        string                     // Name of the queue
-	token       uuid.UUID                  // Token used to identify the queue events
-	ee          *eventemitter.EventEmitter // Event emitter used to handle events occuring in worker threads/go routines/etc
-	running     atomic.Bool                // Flag to indicate if the queue events is running
-	closing     atomic.Bool                // Flag to indicate if the queue events is closing
-	redisClient redis.Cmdable              // Redis client used to interact with the redis server
-	cancel      context.CancelFunc         // Cancel function used to stop the queue events
+	name        string
+	token       uuid.UUID
+	ee          *eventemitter.EventEmitter
+	running     atomic.Bool
+	closing     atomic.Bool
+	redisClient redis.Cmdable
+	cancel      context.CancelFunc
 	prefix      string
 	keyPrefix   string
-	mutex       sync.Mutex     // Mutex used to lock/unlock the queue events
-	wg          sync.WaitGroup // WaitGroup used to wait for the queue events to finish
+	mutex       sync.Mutex
+	wg          sync.WaitGroup
 	opts        struct {
-		LastEventId string // Last event id
+		LastEventId string
 	}
 }
 
+// QueueEventsOptions configures a QueueEvents instance.
 type QueueEventsOptions struct {
-	Autorun bool   // If true, run the queue events immediately after creation
-	Prefix  string // Prefix for the queue events key
+	Autorun     bool   // If true, run the queue events immediately after creation
+	Prefix      string // Prefix for the queue events key
+	LastEventId string // Resume reading the stream after this event id (default: only new events)
 }
 
 // NewQueueEvents creates a new QueueEvents instance.
@@ -55,6 +59,7 @@ func NewQueueEvents(ctx context.Context, name string, client redis.Cmdable, opts
 		ee:          eventemitter.NewEventEmitter(),
 		redisClient: client,
 	}
+	qe.opts.LastEventId = opts.LastEventId
 
 	if opts.Prefix == "" {
 		qe.keyPrefix = "bull"
@@ -82,23 +87,23 @@ func (qe *QueueEvents) Name() string {
 	return qe.name
 }
 
-// Emit emits the event with the given name and arguments
-func (qe *QueueEvents) Emit(event string, args ...interface{}) {
+// emit emits the event with the given name and arguments
+func (qe *QueueEvents) emit(event string, args ...any) {
 	qe.ee.Emit(event, args...)
 }
 
 // Off removes a specific listener by its ListenerID.
-func (qe *QueueEvents) Off(event string, id eventemitter.ListenerID) {
+func (qe *QueueEvents) Off(event string, id ListenerID) {
 	qe.ee.RemoveListener(event, id)
 }
 
 // On listens for the event and returns a ListenerID that can be used with Off.
-func (qe *QueueEvents) On(event string, listener func(...interface{})) eventemitter.ListenerID {
+func (qe *QueueEvents) On(event string, listener func(...any)) ListenerID {
 	return qe.ee.On(event, listener)
 }
 
 // Once listens for the event only once and returns a ListenerID.
-func (qe *QueueEvents) Once(event string, listener func(...interface{})) eventemitter.ListenerID {
+func (qe *QueueEvents) Once(event string, listener func(...any)) ListenerID {
 	return qe.ee.Once(event, listener)
 }
 
@@ -133,7 +138,7 @@ func (qe *QueueEvents) Run(ctx context.Context) error {
 			qe.wg.Done()
 		}()
 		if err := qe.consumeEvents(ctx, client); err != nil {
-			qe.Emit("error", fmt.Sprintf("Critical error in consumeEvents: %v", err))
+			qe.emit("error", fmt.Errorf("critical error in consumeEvents: %v", err))
 			qe.cancel()
 		}
 	}()
@@ -168,7 +173,7 @@ func (qe *QueueEvents) consumeEvents(ctx context.Context, client redis.Cmdable) 
 			if errors.Is(err, redis.Nil) {
 				continue
 			}
-			qe.Emit("error", fmt.Sprintf("Error reading from stream: %v", err))
+			qe.emit("error", fmt.Errorf("error reading from stream: %v", err))
 			select {
 			case <-time.After(500 * time.Millisecond):
 			case <-ctx.Done():
@@ -183,7 +188,7 @@ func (qe *QueueEvents) consumeEvents(ctx context.Context, client redis.Cmdable) 
 				args := message.Values
 
 				if err := qe.processEvent(args, id); err != nil {
-					qe.Emit("error", fmt.Sprintf("Error processing event: %v", err))
+					qe.emit("error", fmt.Errorf("error processing event: %v", err))
 					continue
 				}
 			}
@@ -191,19 +196,15 @@ func (qe *QueueEvents) consumeEvents(ctx context.Context, client redis.Cmdable) 
 	}
 }
 
-// processEvent processes the event with the given arguments
-func (qe *QueueEvents) processEvent(args map[string]interface{}, id string) error {
-	// Extract the event name
+// processEvent parses one stream entry and re-emits it in-process. Progress
+// and completed entries carry a JSON payload that is decoded before emitting,
+// like upstream QueueEvents.
+func (qe *QueueEvents) processEvent(args map[string]any, id string) error {
 	eventName, ok := args["event"].(string)
 	if !ok {
 		return fmt.Errorf("missing or invalid 'event' field in message ID %s", id)
 	}
 
-	// Initialize event data
-	var data interface{}
-	var err error
-
-	// Handle specific events that require data unmarshaling
 	switch eventName {
 	case "progress", "completed":
 		dataKey := "data"
@@ -214,28 +215,27 @@ func (qe *QueueEvents) processEvent(args map[string]interface{}, id string) erro
 		if !ok {
 			return fmt.Errorf("missing or invalid '%s' field in message ID %s", dataKey, id)
 		}
-		// Unmarshal the JSON data
-		if err = json.Unmarshal([]byte(dataStr), &data); err != nil {
+		var data any
+		if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
 			return fmt.Errorf("error unmarshaling '%s': %w", dataKey, err)
 		}
 		args[dataKey] = data
 	}
 
-	// Emit the event
 	qe.emitEvent(eventName, args, id)
 	return nil
 }
 
 // emitEvent emits the event with the given name and arguments
-func (qe *QueueEvents) emitEvent(eventName string, args map[string]interface{}, id string) {
+func (qe *QueueEvents) emitEvent(eventName string, args map[string]any, id string) {
 	jobId, _ := args["jobId"].(string)
 
 	if eventName == "drained" {
-		qe.Emit(eventName, id)
+		qe.emit(eventName, id)
 	} else {
-		qe.Emit(eventName, args, id)
+		qe.emit(eventName, args, id)
 		if jobId != "" {
-			qe.Emit(fmt.Sprintf("%s:%s", eventName, jobId), args, id)
+			qe.emit(fmt.Sprintf("%s:%s", eventName, jobId), args, id)
 		}
 	}
 }
@@ -246,7 +246,7 @@ func (qe *QueueEvents) emitEvent(eventName string, args map[string]interface{}, 
 type CompletedEvent struct {
 	JobID       string
 	StreamID    string
-	ReturnValue interface{}
+	ReturnValue any
 }
 
 // FailedEvent represents a typed failed event from the queue stream.
@@ -260,22 +260,22 @@ type FailedEvent struct {
 type ProgressEvent struct {
 	JobID    string
 	StreamID string
-	Data     interface{}
+	Data     any
 }
 
 // QueueEventData represents a generic typed event from the queue stream.
 type QueueEventData struct {
 	JobID    string
 	StreamID string
-	Data     map[string]interface{}
+	Data     map[string]any
 }
 
 // OnCompleted registers a typed callback for completed events and returns a ListenerID.
-func (qe *QueueEvents) OnCompleted(fn func(CompletedEvent)) eventemitter.ListenerID {
-	return qe.ee.On("completed", func(args ...interface{}) {
+func (qe *QueueEvents) OnCompleted(fn func(CompletedEvent)) ListenerID {
+	return qe.ee.On("completed", func(args ...any) {
 		evt := CompletedEvent{}
 		if len(args) >= 2 {
-			if data, ok := args[0].(map[string]interface{}); ok {
+			if data, ok := args[0].(map[string]any); ok {
 				evt.JobID, _ = data["jobId"].(string)
 				evt.ReturnValue = data["returnvalue"]
 			}
@@ -286,11 +286,11 @@ func (qe *QueueEvents) OnCompleted(fn func(CompletedEvent)) eventemitter.Listene
 }
 
 // OnFailed registers a typed callback for failed events and returns a ListenerID.
-func (qe *QueueEvents) OnFailed(fn func(FailedEvent)) eventemitter.ListenerID {
-	return qe.ee.On("failed", func(args ...interface{}) {
+func (qe *QueueEvents) OnFailed(fn func(FailedEvent)) ListenerID {
+	return qe.ee.On("failed", func(args ...any) {
 		evt := FailedEvent{}
 		if len(args) >= 2 {
-			if data, ok := args[0].(map[string]interface{}); ok {
+			if data, ok := args[0].(map[string]any); ok {
 				evt.JobID, _ = data["jobId"].(string)
 				evt.FailedReason, _ = data["failedReason"].(string)
 			}
@@ -301,11 +301,11 @@ func (qe *QueueEvents) OnFailed(fn func(FailedEvent)) eventemitter.ListenerID {
 }
 
 // OnProgress registers a typed callback for progress events and returns a ListenerID.
-func (qe *QueueEvents) OnProgress(fn func(ProgressEvent)) eventemitter.ListenerID {
-	return qe.ee.On("progress", func(args ...interface{}) {
+func (qe *QueueEvents) OnProgress(fn func(ProgressEvent)) ListenerID {
+	return qe.ee.On("progress", func(args ...any) {
 		evt := ProgressEvent{}
 		if len(args) >= 2 {
-			if data, ok := args[0].(map[string]interface{}); ok {
+			if data, ok := args[0].(map[string]any); ok {
 				evt.JobID, _ = data["jobId"].(string)
 				evt.Data = data["data"]
 			}
@@ -316,11 +316,11 @@ func (qe *QueueEvents) OnProgress(fn func(ProgressEvent)) eventemitter.ListenerI
 }
 
 // OnActive registers a typed callback for active events and returns a ListenerID.
-func (qe *QueueEvents) OnActive(fn func(QueueEventData)) eventemitter.ListenerID {
-	return qe.ee.On("active", func(args ...interface{}) {
+func (qe *QueueEvents) OnActive(fn func(QueueEventData)) ListenerID {
+	return qe.ee.On("active", func(args ...any) {
 		evt := QueueEventData{}
 		if len(args) >= 2 {
-			if data, ok := args[0].(map[string]interface{}); ok {
+			if data, ok := args[0].(map[string]any); ok {
 				evt.JobID, _ = data["jobId"].(string)
 				evt.Data = data
 			}
@@ -331,11 +331,11 @@ func (qe *QueueEvents) OnActive(fn func(QueueEventData)) eventemitter.ListenerID
 }
 
 // OnStalled registers a typed callback for stalled events and returns a ListenerID.
-func (qe *QueueEvents) OnStalled(fn func(QueueEventData)) eventemitter.ListenerID {
-	return qe.ee.On("stalled", func(args ...interface{}) {
+func (qe *QueueEvents) OnStalled(fn func(QueueEventData)) ListenerID {
+	return qe.ee.On("stalled", func(args ...any) {
 		evt := QueueEventData{}
 		if len(args) >= 2 {
-			if data, ok := args[0].(map[string]interface{}); ok {
+			if data, ok := args[0].(map[string]any); ok {
 				evt.JobID, _ = data["jobId"].(string)
 				evt.Data = data
 			}
@@ -346,8 +346,8 @@ func (qe *QueueEvents) OnStalled(fn func(QueueEventData)) eventemitter.ListenerI
 }
 
 // OnDrained registers a typed callback for drained events and returns a ListenerID.
-func (qe *QueueEvents) OnDrained(fn func(streamID string)) eventemitter.ListenerID {
-	return qe.ee.On("drained", func(args ...interface{}) {
+func (qe *QueueEvents) OnDrained(fn func(streamID string)) ListenerID {
+	return qe.ee.On("drained", func(args ...any) {
 		var streamID string
 		if len(args) >= 1 {
 			streamID, _ = args[0].(string)
@@ -357,8 +357,8 @@ func (qe *QueueEvents) OnDrained(fn func(streamID string)) eventemitter.Listener
 }
 
 // OnError registers a typed callback for error events and returns a ListenerID.
-func (qe *QueueEvents) OnError(fn func(err error)) eventemitter.ListenerID {
-	return qe.ee.On("error", func(args ...interface{}) {
+func (qe *QueueEvents) OnError(fn func(err error)) ListenerID {
+	return qe.ee.On("error", func(args ...any) {
 		if len(args) >= 1 {
 			switch e := args[0].(type) {
 			case error:
@@ -378,13 +378,14 @@ func (qe *QueueEvents) Ping(ctx context.Context) error {
 	return err
 }
 
-// Close stops the queue events with a default 5-second shutdown timeout.
+// Close stops the queue events consumer. The consumer exits within one
+// blocking stream read after cancellation; Close waits for it with an
+// internal bound.
 func (qe *QueueEvents) Close() error {
-	return qe.CloseWithTimeout(5 * time.Second)
-}
+	// The consumer exits within one 2s XRead block after cancel; 5s is a
+	// generous internal bound.
+	const timeout = 5 * time.Second
 
-// CloseWithTimeout stops the queue events, waiting up to timeout for graceful shutdown.
-func (qe *QueueEvents) CloseWithTimeout(timeout time.Duration) error {
 	qe.mutex.Lock()
 	defer qe.mutex.Unlock()
 

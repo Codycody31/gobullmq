@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Promote executes the Lua script promote on Redis with 7 keys.
-func Promote(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 7 {
-		return nil, fmt.Errorf("expected 7 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// PromoteScript is the promote script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var PromoteScript = redis.NewScript(`--[[
   Promotes a job that is currently "delayed" to the "waiting" state
     Input:
       KEYS[1] 'delayed'
@@ -90,8 +87,14 @@ if rcall("ZREM", KEYS[1], jobId) == 1 then
   return 0
 else
   return -3
-end`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+end`)
+
+// Promote executes the Lua script promote on Redis with 7 keys.
+func Promote(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 7 {
+		return nil, fmt.Errorf("expected 7 keys but got %d", len(keys))
+	}
+	result, err := PromoteScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

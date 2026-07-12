@@ -10,6 +10,17 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6390:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,6 +41,67 @@ jobs:
       - name: Verify build
         run: go build ./...
 
-      - name: Run unit tests
-        run: go test -v ./...
+      - name: Vet
+        run: go vet ./...
 
+      - name: Run tests
+        run: go test -v ./...
+        env:
+          REDIS_ADDR: localhost:6390
+
+  # golangci-lint v2 (see .golangci.yml); action v8 is the v2-compatible major.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  # The Lua layer must stay byte-identical to the pinned upstream BullMQ tag.
+  lua-drift:
+    runs-on: ubuntu-latest
+    env:
+      BULLMQ_TAG: v4.12.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream BullMQ
+        run: git clone --depth 1 --branch "$BULLMQ_TAG" https://github.com/taskforcesh/bullmq /tmp/bullmq
+
+      - name: Diff Lua scripts against upstream
+        run: |
+          fail=0
+          for f in internal/lua/*.lua; do
+            n=$(basename "$f")
+            up="/tmp/bullmq/src/commands/$n"
+            if [ ! -f "$up" ]; then echo "::error::no upstream script for $n"; fail=1; continue; fi
+            diff -u "$up" "$f" || { echo "::error::$n drifted from upstream $BULLMQ_TAG"; fail=1; }
+          done
+          for f in internal/lua/includes/*.lua; do
+            n=$(basename "$f")
+            up="/tmp/bullmq/src/commands/includes/$n"
+            if [ ! -f "$up" ]; then echo "::error::no upstream include for $n"; fail=1; continue; fi
+            diff -u "$up" "$f" || { echo "::error::includes/$n drifted from upstream $BULLMQ_TAG"; fail=1; }
+          done
+          exit $fail
+
+      - name: Setup Go
+        if: success()
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify generated wrappers are in sync
+        run: |
+          go run scripts/generate_lua.go
+          git diff --exit-code internal/lua/ || { echo "::error::generated *_lua.go files are stale; run go run scripts/generate_lua.go"; exit 1; }

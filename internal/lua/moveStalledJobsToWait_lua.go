@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// MoveStalledJobsToWait executes the Lua script moveStalledJobsToWait on Redis with 8 keys.
-func MoveStalledJobsToWait(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 8 {
-		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// MoveStalledJobsToWaitScript is the moveStalledJobsToWait script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var MoveStalledJobsToWaitScript = redis.NewScript(`--[[
   Move stalled jobs to wait.
     Input:
       KEYS[1] 'stalled' (SET)
@@ -499,8 +496,14 @@ local function checkStalledJobs(stalledKey, waitKey, activeKey, failedKey,
 end
 return checkStalledJobs(KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6],
                         KEYS[7], KEYS[8], ARGV[1], ARGV[2], ARGV[3], ARGV[4])
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// MoveStalledJobsToWait executes the Lua script moveStalledJobsToWait on Redis with 8 keys.
+func MoveStalledJobsToWait(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 8 {
+		return nil, fmt.Errorf("expected 8 keys but got %d", len(keys))
+	}
+	result, err := MoveStalledJobsToWaitScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

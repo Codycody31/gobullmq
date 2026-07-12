@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// MoveToFinished executes the Lua script moveToFinished on Redis with 13 keys.
-func MoveToFinished(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 13 {
-		return nil, fmt.Errorf("expected 13 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// MoveToFinishedScript is the moveToFinished script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var MoveToFinishedScript = redis.NewScript(`--[[
   Move job from active to a finished status (completed o failed)
   A job can only be moved to completed if it was active.
   The job must be locked before it can be moved to a finished status,
@@ -1076,8 +1073,14 @@ if rcall("EXISTS", jobIdKey) == 1 then -- // Make sure job exists
 else
     return -1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// MoveToFinished executes the Lua script moveToFinished on Redis with 13 keys.
+func MoveToFinished(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 13 {
+		return nil, fmt.Errorf("expected 13 keys but got %d", len(keys))
+	}
+	result, err := MoveToFinishedScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

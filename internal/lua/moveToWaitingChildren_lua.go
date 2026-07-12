@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// MoveToWaitingChildren executes the Lua script moveToWaitingChildren on Redis with 4 keys.
-func MoveToWaitingChildren(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 4 {
-		return nil, fmt.Errorf("expected 4 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// MoveToWaitingChildrenScript is the moveToWaitingChildren script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var MoveToWaitingChildrenScript = redis.NewScript(`--[[
   Moves job from active to waiting children set.
   Input:
     KEYS[1] lock key
@@ -62,8 +59,14 @@ if rcall("EXISTS", KEYS[4]) == 1 then
   end
 end
 return -1
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// MoveToWaitingChildren executes the Lua script moveToWaitingChildren on Redis with 4 keys.
+func MoveToWaitingChildren(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 4 {
+		return nil, fmt.Errorf("expected 4 keys but got %d", len(keys))
+	}
+	result, err := MoveToWaitingChildrenScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

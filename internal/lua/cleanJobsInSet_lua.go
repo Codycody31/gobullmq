@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// CleanJobsInSet executes the Lua script cleanJobsInSet on Redis with 2 keys.
-func CleanJobsInSet(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 2 {
-		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// CleanJobsInSetScript is the cleanJobsInSet script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var CleanJobsInSetScript = redis.NewScript(`--[[
   Remove jobs from the specific set.
   Input:
     KEYS[1]  set key,
@@ -388,8 +385,14 @@ else
 end
 rcall("XADD", KEYS[2], "*", "event", "cleaned", "count", result[2])
 return result[1]
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// CleanJobsInSet executes the Lua script cleanJobsInSet on Redis with 2 keys.
+func CleanJobsInSet(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 2 {
+		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
+	}
+	result, err := CleanJobsInSetScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

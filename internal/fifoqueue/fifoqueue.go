@@ -13,14 +13,14 @@ type FifoQueue[T any] struct {
 	queue        chan T                 // Channel to queue items (results)
 	errors       chan error             // Channel for errors
 	tasks        chan func() (T, error) // Channel of tasks to execute
-	pending      sync.WaitGroup         // WaitGroup to manage pending tasks
 	ignoreErrors bool                   // Flag to ignore errors
 	isClosed     atomic.Bool            // Thread-safe flag for queue state
 	pendingCount atomic.Int32           // Thread-safe counter for pending tasks
-	mu           sync.RWMutex           // Mutex for thread-safe operations
 	ctx          context.Context
 	cancel       context.CancelFunc
 	workers      int
+	workerWG     sync.WaitGroup
+	workersDone  chan struct{}
 }
 
 // NewFifoQueue initializes a new FifoQueue with a fixed number of worker goroutines.
@@ -38,15 +38,22 @@ func NewFifoQueue[T any](workers int, ignoreErrors bool) *FifoQueue[T] {
 		ctx:          ctx,
 		cancel:       cancel,
 		workers:      workers,
+		workersDone:  make(chan struct{}),
 	}
 	q.pendingCount.Store(0)
 	q.startWorkers()
+	go func() {
+		q.workerWG.Wait()
+		close(q.workersDone)
+	}()
 	return q
 }
 
 func (q *FifoQueue[T]) startWorkers() {
 	for i := 0; i < q.workers; i++ {
+		q.workerWG.Add(1)
 		go func() {
+			defer q.workerWG.Done()
 			for {
 				select {
 				case <-q.ctx.Done():
@@ -63,12 +70,8 @@ func (q *FifoQueue[T]) startWorkers() {
 }
 
 func (q *FifoQueue[T]) executeTask(task func() (T, error)) {
-	q.pending.Add(1)
 	q.pendingCount.Add(1)
-	defer func() {
-		q.pending.Done()
-		q.pendingCount.Add(-1)
-	}()
+	defer q.pendingCount.Add(-1)
 
 	select {
 	case <-q.ctx.Done():
@@ -127,45 +130,32 @@ func (q *FifoQueue[T]) Fetch(ctx context.Context) (*T, error) {
 	}
 }
 
-// WaitAll waits until all tasks are completed (with timeout) and properly closes the queue.
-// The timeout parameter specifies the maximum time to wait for tasks to complete.
-// Returns an error if the timeout is exceeded.
+// WaitAll stops accepting work, cancels the pool, and waits for its workers to
+// exit. Channels are deliberately left open: closing them while a task or an
+// Add call is still publishing would turn an ordinary shutdown timeout into a
+// send-on-closed-channel panic.
 func (q *FifoQueue[T]) WaitAll(timeout time.Duration) error {
-	q.mu.Lock()
-	if !q.isClosed.Load() {
-		q.isClosed.Store(true)
-		close(q.tasks) // stop accepting new tasks
-		q.cancel()     // cancel context FIRST to unblock any blocked tasks
-		q.mu.Unlock()
+	if q.isClosed.CompareAndSwap(false, true) {
+		q.cancel()
+	}
 
-		// Wait for pending tasks with timeout
-		done := make(chan struct{})
-		go func() {
-			q.pending.Wait()
-			close(done)
-		}()
-
-		var timedOut bool
+	if timeout <= 0 {
 		select {
-		case <-done:
-			// All tasks completed normally
-		case <-time.After(timeout):
-			// Timeout - force close anyway
-			timedOut = true
-		}
-
-		q.mu.Lock()
-		close(q.queue)
-		close(q.errors)
-		q.mu.Unlock()
-
-		if timedOut {
+		case <-q.workersDone:
+			return nil
+		default:
 			return ErrWaitTimeout
 		}
-		return nil
 	}
-	q.mu.Unlock()
-	return nil
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-q.workersDone:
+		return nil
+	case <-timer.C:
+		return ErrWaitTimeout
+	}
 }
 
 // NumPending returns the number of pending tasks.

@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RetryJob executes the Lua script retryJob on Redis with 9 keys.
-func RetryJob(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 9 {
-		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// RetryJobScript is the retryJob script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var RetryJobScript = redis.NewScript(`--[[
   Retries a failed job by moving it back to the wait queue.
     Input:
       KEYS[1] 'active',
@@ -154,8 +151,14 @@ if rcall("EXISTS", KEYS[4]) == 1 then
 else
   return -1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// RetryJob executes the Lua script retryJob on Redis with 9 keys.
+func RetryJob(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 9 {
+		return nil, fmt.Errorf("expected 9 keys but got %d", len(keys))
+	}
+	result, err := RetryJobScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

@@ -11,7 +11,7 @@ func TestEventEmitter_On(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	e.On("testEvent", func(args ...interface{}) {
+	e.On("testEvent", func(args ...any) {
 		if args[0].(string) != "test" {
 			t.Errorf("Expected 'test', got %v", args[0])
 		}
@@ -29,11 +29,11 @@ func TestEventEmitter_MultipleListeners(t *testing.T) {
 
 	var count1, count2 atomic.Int32
 
-	e.On("multi", func(args ...interface{}) {
+	e.On("multi", func(args ...any) {
 		count1.Add(1)
 		wg.Done()
 	})
-	e.On("multi", func(args ...interface{}) {
+	e.On("multi", func(args ...any) {
 		count2.Add(1)
 		wg.Done()
 	})
@@ -52,7 +52,7 @@ func TestEventEmitter_Once(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	e.Once("onceEvent", func(args ...interface{}) {
+	e.Once("onceEvent", func(args ...any) {
 		count.Add(1)
 		wg.Done()
 	})
@@ -72,7 +72,7 @@ func TestEventEmitter_RemoveListener(t *testing.T) {
 	e := NewEventEmitter()
 	var count atomic.Int32
 
-	id := e.On("testRemoveEvent", func(args ...interface{}) {
+	id := e.On("testRemoveEvent", func(args ...any) {
 		count.Add(1)
 	})
 
@@ -88,10 +88,10 @@ func TestEventEmitter_RemoveSpecificListener(t *testing.T) {
 	e := NewEventEmitter()
 	var count1, count2 atomic.Int32
 
-	id1 := e.On("event", func(args ...interface{}) {
+	id1 := e.On("event", func(args ...any) {
 		count1.Add(1)
 	})
-	e.On("event", func(args ...interface{}) {
+	e.On("event", func(args ...any) {
 		count2.Add(1)
 	})
 
@@ -111,10 +111,10 @@ func TestEventEmitter_RemoveAllListeners(t *testing.T) {
 	e := NewEventEmitter()
 	var count1, count2 atomic.Int32
 
-	e.On("testRemoveAllEvent", func(args ...interface{}) {
+	e.On("testRemoveAllEvent", func(args ...any) {
 		count1.Add(1)
 	})
-	e.On("testRemoveAllEvent", func(args ...interface{}) {
+	e.On("testRemoveAllEvent", func(args ...any) {
 		count2.Add(1)
 	})
 
@@ -130,8 +130,8 @@ func TestEventEmitter_RemoveAll(t *testing.T) {
 	e := NewEventEmitter()
 	var count atomic.Int32
 
-	e.On("event1", func(args ...interface{}) { count.Add(1) })
-	e.On("event2", func(args ...interface{}) { count.Add(1) })
+	e.On("event1", func(args ...any) { count.Add(1) })
+	e.On("event2", func(args ...any) { count.Add(1) })
 
 	e.RemoveAll()
 	e.Emit("event1", "test")
@@ -147,7 +147,7 @@ func TestEventEmitter_Emit(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	e.On("testEmitEvent", func(args ...interface{}) {
+	e.On("testEmitEvent", func(args ...any) {
 		if args[0].(string) != "emit" {
 			t.Errorf("Expected 'emit', got %v", args[0])
 		}
@@ -168,7 +168,7 @@ func TestEventEmitter_ConcurrentEmitAndRemove(t *testing.T) {
 	e := NewEventEmitter()
 	var wg sync.WaitGroup
 
-	e.On("concurrent", func(args ...interface{}) {})
+	e.On("concurrent", func(args ...any) {})
 
 	wg.Add(2)
 	go func() {
@@ -180,7 +180,7 @@ func TestEventEmitter_ConcurrentEmitAndRemove(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			e.On("concurrent", func(args ...interface{}) {})
+			e.On("concurrent", func(args ...any) {})
 			e.RemoveAllListeners("concurrent")
 		}
 	}()
@@ -189,9 +189,9 @@ func TestEventEmitter_ConcurrentEmitAndRemove(t *testing.T) {
 
 func TestEventEmitter_ListenerIDUniqueness(t *testing.T) {
 	e := NewEventEmitter()
-	id1 := e.On("event", func(args ...interface{}) {})
-	id2 := e.On("event", func(args ...interface{}) {})
-	id3 := e.Once("event", func(args ...interface{}) {})
+	id1 := e.On("event", func(args ...any) {})
+	id2 := e.On("event", func(args ...any) {})
+	id3 := e.Once("event", func(args ...any) {})
 
 	if id1 == id2 || id2 == id3 || id1 == id3 {
 		t.Errorf("Listener IDs should be unique, got %d, %d, %d", id1, id2, id3)
@@ -203,6 +203,6 @@ func TestEventEmitter_RemoveNonexistentListener(t *testing.T) {
 	// Should not panic when removing a listener that doesn't exist
 	e.RemoveListener("nonexistent", 999)
 
-	e.On("event", func(args ...interface{}) {})
+	e.On("event", func(args ...any) {})
 	e.RemoveListener("event", 999) // wrong ID
 }

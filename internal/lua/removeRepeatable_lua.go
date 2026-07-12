@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RemoveRepeatable executes the Lua script removeRepeatable on Redis with 2 keys.
-func RemoveRepeatable(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 2 {
-		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// RemoveRepeatableScript is the removeRepeatable script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var RemoveRepeatableScript = redis.NewScript(`--[[
   Removes a repeatable job
   Input:
     KEYS[1] repeat jobs key
@@ -41,8 +38,14 @@ if(rcall("ZREM", KEYS[1], ARGV[2]) == 1) then
   return 0
 end
 return 1
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// RemoveRepeatable executes the Lua script removeRepeatable on Redis with 2 keys.
+func RemoveRepeatable(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 2 {
+		return nil, fmt.Errorf("expected 2 keys but got %d", len(keys))
+	}
+	result, err := RemoveRepeatableScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

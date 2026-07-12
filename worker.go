@@ -30,21 +30,27 @@ type ProcessFunc[D any, R any] func(ctx context.Context, job *Job[D]) (R, error)
 // Worker processes jobs from a queue.
 // D is the type of job data, R is the type of job results.
 type Worker[D any, R any] struct {
-	name        string
-	token       uuid.UUID
-	ee          *eventemitter.EventEmitter
-	running     atomic.Bool
-	closing     atomic.Bool
-	paused      atomic.Bool
-	redisClient redis.Cmdable
-	ctx         context.Context
-	cancel      context.CancelFunc
-	prefix      string
-	keyPrefix   string
-	mutex       sync.Mutex
-	wg          sync.WaitGroup
-	opts        WorkerOptions
-	processFn   ProcessFunc[D, R]
+	name         string
+	token        uuid.UUID
+	ee           *eventemitter.EventEmitter
+	running      atomic.Bool
+	closing      atomic.Bool
+	forceClosing atomic.Bool
+	paused       atomic.Bool
+	redisClient  redis.Cmdable
+	// runCtx is the run-lifetime context created by Run and cancelled by
+	// Close/Shutdown. Storing a context in a struct is normally discouraged,
+	// but a worker is a long-lived process whose background goroutines,
+	// timers, and Redis calls all share one lifetime, the documented
+	// exception to that rule.
+	runCtx    context.Context
+	cancel    context.CancelFunc
+	prefix    string
+	keyPrefix string
+	mutex     sync.Mutex
+	wg        sync.WaitGroup
+	opts      WorkerOptions
+	processFn ProcessFunc[D, R]
 
 	extendLocksTimer  *time.Timer
 	stalledCheckTimer *time.Timer
@@ -52,8 +58,18 @@ type Worker[D any, R any] struct {
 	jobsInProgress *jobsInProgress
 
 	blockUntil atomic.Int64
+	// limitUntil holds an absolute epoch-ms deadline for the rate-limit
+	// window (0 when unlimited).
 	limitUntil atomic.Int64
 	drained    atomic.Bool
+
+	// blockingFetch serializes the blocking wait-list read so at most one
+	// BLMOVE blocks at a time (upstream's this.waiting guard).
+	blockingFetch sync.Mutex
+	// waitCancel aborts an in-flight blocking read (upstream force-disconnects
+	// the blocking connection on pause/close).
+	waitCancelMu sync.Mutex
+	waitCancel   context.CancelFunc
 
 	scripts *scripts
 
@@ -81,7 +97,6 @@ type WorkerOptions struct {
 	RunRetryDelay    time.Duration
 	Backoff          *BackoffOptions
 	BackoffStrategy  BackoffStrategyFunc
-	ShutdownTimeout  time.Duration
 }
 
 // BackoffStrategyFunc is a custom function to calculate backoff delay in milliseconds.
@@ -89,16 +104,19 @@ type WorkerOptions struct {
 // Return -1 to signal "do not retry" (move to failed).
 type BackoffStrategyFunc func(attemptsMade int, opts *BackoffOptions, err error, jobID string) int
 
+// RateLimiterOptions caps the worker at Max jobs per Duration milliseconds.
 type RateLimiterOptions struct {
 	Max      int `msgpack:"max"`
 	Duration int `msgpack:"duration"`
 }
 
+// MetricsOptions enables collection of completed/failed job counts, keeping
+// up to MaxDataPoints one-minute data points.
 type MetricsOptions struct {
 	MaxDataPoints int
 }
 
-type GetNextJobOptions struct {
+type nextJobOptions struct {
 	Block bool
 }
 
@@ -118,8 +136,8 @@ func (w *Worker[D, R]) Name() string {
 }
 
 // OnCompleted registers a typed callback for when a job completes and returns a ListenerID.
-func (w *Worker[D, R]) OnCompleted(fn func(job *Job[D], result R)) eventemitter.ListenerID {
-	return w.ee.On("completed", func(args ...interface{}) {
+func (w *Worker[D, R]) OnCompleted(fn func(job *Job[D], result R)) ListenerID {
+	return w.ee.On("completed", func(args ...any) {
 		if len(args) >= 2 {
 			if raw, ok := args[0].(rawJob); ok {
 				typed, _ := wrapRawJob[D](&raw)
@@ -134,8 +152,8 @@ func (w *Worker[D, R]) OnCompleted(fn func(job *Job[D], result R)) eventemitter.
 }
 
 // OnFailed registers a typed callback for when a job fails and returns a ListenerID.
-func (w *Worker[D, R]) OnFailed(fn func(job *Job[D], err error)) eventemitter.ListenerID {
-	return w.ee.On("failed", func(args ...interface{}) {
+func (w *Worker[D, R]) OnFailed(fn func(job *Job[D], err error)) ListenerID {
+	return w.ee.On("failed", func(args ...any) {
 		if len(args) >= 2 {
 			if raw, ok := args[0].(rawJob); ok {
 				typed, _ := wrapRawJob[D](&raw)
@@ -150,8 +168,8 @@ func (w *Worker[D, R]) OnFailed(fn func(job *Job[D], err error)) eventemitter.Li
 }
 
 // OnActive registers a typed callback for when a job becomes active and returns a ListenerID.
-func (w *Worker[D, R]) OnActive(fn func(job *Job[D])) eventemitter.ListenerID {
-	return w.ee.On("active", func(args ...interface{}) {
+func (w *Worker[D, R]) OnActive(fn func(job *Job[D])) ListenerID {
+	return w.ee.On("active", func(args ...any) {
 		if len(args) >= 1 {
 			if raw, ok := args[0].(rawJob); ok {
 				typed, _ := wrapRawJob[D](&raw)
@@ -164,8 +182,8 @@ func (w *Worker[D, R]) OnActive(fn func(job *Job[D])) eventemitter.ListenerID {
 }
 
 // OnStalled registers a typed callback for when a job is detected as stalled and returns a ListenerID.
-func (w *Worker[D, R]) OnStalled(fn func(jobID string)) eventemitter.ListenerID {
-	return w.ee.On("stalled", func(args ...interface{}) {
+func (w *Worker[D, R]) OnStalled(fn func(jobID string)) ListenerID {
+	return w.ee.On("stalled", func(args ...any) {
 		if len(args) >= 1 {
 			if id, ok := args[0].(string); ok {
 				fn(id)
@@ -175,15 +193,15 @@ func (w *Worker[D, R]) OnStalled(fn func(jobID string)) eventemitter.ListenerID 
 }
 
 // OnDrained registers a typed callback for when the queue is drained and returns a ListenerID.
-func (w *Worker[D, R]) OnDrained(fn func()) eventemitter.ListenerID {
-	return w.ee.On("drained", func(args ...interface{}) {
+func (w *Worker[D, R]) OnDrained(fn func()) ListenerID {
+	return w.ee.On("drained", func(...any) {
 		fn()
 	})
 }
 
 // OnError registers a typed callback for worker errors and returns a ListenerID.
-func (w *Worker[D, R]) OnError(fn func(err error)) eventemitter.ListenerID {
-	return w.ee.On("error", func(args ...interface{}) {
+func (w *Worker[D, R]) OnError(fn func(err error)) ListenerID {
+	return w.ee.On("error", func(args ...any) {
 		if len(args) >= 1 {
 			switch e := args[0].(type) {
 			case error:
@@ -198,8 +216,8 @@ func (w *Worker[D, R]) OnError(fn func(err error)) eventemitter.ListenerID {
 }
 
 // OnRetriesExhausted registers a typed callback for when all retry attempts are exhausted and returns a ListenerID.
-func (w *Worker[D, R]) OnRetriesExhausted(fn func(job *Job[D], err error)) eventemitter.ListenerID {
-	return w.ee.On("retries-exhausted", func(args ...interface{}) {
+func (w *Worker[D, R]) OnRetriesExhausted(fn func(job *Job[D], err error)) ListenerID {
+	return w.ee.On("retries-exhausted", func(args ...any) {
 		if len(args) >= 2 {
 			if raw, ok := args[0].(rawJob); ok {
 				typed, _ := wrapRawJob[D](&raw)
@@ -215,7 +233,7 @@ func (w *Worker[D, R]) OnRetriesExhausted(fn func(job *Job[D], err error)) event
 
 // nextJobData represents the structured data returned by raw2NextJobData.
 type nextJobData struct {
-	JobData    map[string]interface{}
+	JobData    map[string]any
 	ID         string
 	LimitUntil int64
 	DelayUntil int64
@@ -226,9 +244,8 @@ const (
 	defaultLockDuration    = 30 * time.Second
 	defaultLockRenewTime   = 15 * time.Second
 	defaultStalledInterval = 30 * time.Second
-	defaultRunRetryDelay   = 250 * time.Millisecond
-	defaultDrainDelay      = 1 * time.Second
-	defaultShutdownTimeout = 5 * time.Second
+	defaultRunRetryDelay   = 15 * time.Second // upstream runRetryDelay: 15000
+	defaultDrainDelay      = 5 * time.Second  // upstream drainDelay: 5
 	minQueueCleanupTimeout = time.Second
 )
 
@@ -254,17 +271,19 @@ func NewWorker[D any, R any](name string, client redis.Cmdable, processor Proces
 	if opts.StalledInterval <= 0 {
 		opts.StalledInterval = defaultStalledInterval
 	}
+	if opts.MaxStalledCount == 0 {
+		opts.MaxStalledCount = 1
+	} else if opts.MaxStalledCount < 0 {
+		opts.MaxStalledCount = 0
+	}
 	if opts.Concurrency <= 0 {
 		opts.Concurrency = 1
 	}
 	if opts.RunRetryDelay <= 0 {
 		opts.RunRetryDelay = defaultRunRetryDelay
 	}
-	if opts.DrainDelay < 0 {
+	if opts.DrainDelay <= 0 {
 		opts.DrainDelay = defaultDrainDelay
-	}
-	if opts.ShutdownTimeout <= 0 {
-		opts.ShutdownTimeout = defaultShutdownTimeout
 	}
 
 	w := &Worker[D, R]{
@@ -292,32 +311,35 @@ func NewWorker[D any, R any](name string, client redis.Cmdable, processor Proces
 	w.keyPrefix = w.keyPrefix + ":" + name + ":"
 
 	w.scripts = newScripts(w.redisClient, w.keyPrefix)
+	w.scripts.limiter = opts.Limiter
+	w.scripts.removeOnComplete = opts.RemoveOnComplete
+	w.scripts.removeOnFail = opts.RemoveOnFail
 
 	return w, nil
 }
 
-// Emit emits the event with the given name and arguments.
-func (w *Worker[D, R]) Emit(event string, args ...interface{}) {
+// emit emits the event with the given name and arguments.
+func (w *Worker[D, R]) emit(event string, args ...any) {
 	w.ee.Emit(event, args...)
 }
 
 // Off removes a specific listener by its ListenerID.
-func (w *Worker[D, R]) Off(event string, id eventemitter.ListenerID) {
+func (w *Worker[D, R]) Off(event string, id ListenerID) {
 	w.ee.RemoveListener(event, id)
 }
 
 // On listens for the event and returns a ListenerID that can be used with Off.
-func (w *Worker[D, R]) On(event string, listener func(...interface{})) eventemitter.ListenerID {
+func (w *Worker[D, R]) On(event string, listener func(...any)) ListenerID {
 	return w.ee.On(event, listener)
 }
 
 // Once listens for the event only once and returns a ListenerID.
-func (w *Worker[D, R]) Once(event string, listener func(...interface{})) eventemitter.ListenerID {
+func (w *Worker[D, R]) Once(event string, listener func(...any)) ListenerID {
 	return w.ee.Once(event, listener)
 }
 
 // createJob constructs a rawJob from the map data retrieved from Redis.
-func (w *Worker[D, R]) createJob(jobData map[string]interface{}, jobId string) (rawJob, error) {
+func (w *Worker[D, R]) createJob(jobData map[string]any, jobId string) (rawJob, error) {
 	job, err := jobFromJson(jobData)
 	if err != nil {
 		return rawJob{}, fmt.Errorf("failed to deserialize job %s: %w", jobId, err)
@@ -335,15 +357,14 @@ func (w *Worker[D, R]) Run(ctx context.Context) error {
 	if w.running.Load() {
 		return ErrWorkerRunning
 	}
-
-	w.running.Store(true)
-
 	if w.closing.Load() {
 		return ErrWorkerClosing
 	}
 
+	w.running.Store(true)
+
 	ctx, cancel := context.WithCancel(ctx)
-	w.ctx = ctx
+	w.runCtx = ctx
 	w.cancel = cancel
 
 	clientName := fmt.Sprintf("%s:%s", w.prefix, base64.StdEncoding.EncodeToString([]byte(w.name)))
@@ -363,14 +384,17 @@ func (w *Worker[D, R]) Run(ctx context.Context) error {
 	tokenPostfix := 0
 
 	addFetchTask := func() {
-		if w.closing.Load() || w.paused.Load() {
+		// Fetch tasks ARE re-added while paused: they park in getNextJob's
+		// pause-wait loop and Resume wakes them. Refusing to re-add here
+		// would leave a resumed worker with zero fetchers (livelock).
+		if w.closing.Load() {
 			return
 		}
 		tokenPostfix++
 		token := fmt.Sprintf("%s:%d", w.token, tokenPostfix)
 		if err := w.asyncFifoQueue.Add(func() (rawJob, error) {
 			j, err := w.retryIfFailed(func() (*rawJob, error) {
-				nextJob, err := w.getNextJob(token, GetNextJobOptions{Block: true})
+				nextJob, err := w.getNextJob(w.runCtx, token, nextJobOptions{Block: true})
 				if err != nil {
 					return nil, err
 				}
@@ -382,7 +406,7 @@ func (w *Worker[D, R]) Run(ctx context.Context) error {
 			}, w.opts.RunRetryDelay)
 
 			if err != nil {
-				w.Emit("error", fmt.Sprintf("Error fetching job: %v", err))
+				w.emit("error", fmt.Errorf("error fetching job: %v", err))
 				return rawJob{}, err
 			}
 
@@ -392,7 +416,7 @@ func (w *Worker[D, R]) Run(ctx context.Context) error {
 
 			return j, nil
 		}); err != nil {
-			w.Emit("error", fmt.Sprintf("Error adding fetch task to queue: %v", err))
+			w.emit("error", fmt.Errorf("error adding fetch task to queue: %v", err))
 		}
 	}
 
@@ -405,21 +429,25 @@ func (w *Worker[D, R]) Run(ctx context.Context) error {
 		}
 
 		for {
+			if w.closing.Load() && w.asyncFifoQueue.NumTotal() == 0 {
+				w.emit("closing")
+				return
+			}
 			select {
-			case <-w.ctx.Done():
-				w.Emit("closing")
+			case <-w.runCtx.Done():
+				w.emit("closing")
 				return
 			default:
 			}
 
-			jobResult, taskErr := w.asyncFifoQueue.Fetch(w.ctx)
+			jobResult, taskErr := w.asyncFifoQueue.Fetch(w.runCtx)
 
 			if taskErr != nil {
 				if errors.Is(taskErr, context.Canceled) || errors.Is(taskErr, fifoqueue.ErrQueueClosed) {
-					w.Emit("info", fmt.Sprintf("Worker stopping due to context cancellation or queue closure: %v", taskErr))
+					w.emit("info", fmt.Sprintf("Worker stopping due to context cancellation or queue closure: %v", taskErr))
 					return
 				}
-				w.Emit("error", fmt.Sprintf("Error fetching task result from queue: %v", taskErr))
+				w.emit("error", fmt.Errorf("error fetching task result from queue: %v", taskErr))
 				addFetchTask()
 				continue
 			}
@@ -427,18 +455,29 @@ func (w *Worker[D, R]) Run(ctx context.Context) error {
 			if jobResult != nil && jobResult.id != "" && jobResult.id != "0" {
 				fetchedJob := *jobResult
 				token := fetchedJob.token
+				w.trackJob(fetchedJob)
 
 				if err := w.asyncFifoQueue.Add(func() (rawJob, error) {
-					w.processJob(
-						fetchedJob,
-						token,
-						func() bool {
-							return w.asyncFifoQueue.NumTotal() < w.opts.Concurrency
-						},
-					)
+					// Chain jobs handed back by moveToFinished's fetch-next
+					// under the same token, like upstream's process loop;
+					// otherwise the prefetched job is stranded in active.
+					job := fetchedJob
+					for job.id != "" && job.id != "0" {
+						next, _ := w.processJob(
+							job,
+							token,
+							func() bool {
+								// The running process task counts in NumTotal
+								// (upstream: numTotal() <= concurrency).
+								return w.asyncFifoQueue.NumTotal() <= w.opts.Concurrency
+							},
+						)
+						job = next
+					}
 					return rawJob{}, nil
 				}); err != nil {
-					w.Emit("error", fmt.Sprintf("Error adding process task for job %s: %v", fetchedJob.id, err))
+					w.untrackJob(fetchedJob.id)
+					w.emit("error", fmt.Errorf("error adding process task for job %s: %v", fetchedJob.id, err))
 					addFetchTask()
 				}
 			} else {
@@ -451,14 +490,14 @@ func (w *Worker[D, R]) Run(ctx context.Context) error {
 }
 
 // getNextJob gets the next job.
-func (w *Worker[D, R]) getNextJob(token string, opts GetNextJobOptions) (*rawJob, error) {
+func (w *Worker[D, R]) getNextJob(ctx context.Context, token string, opts nextJobOptions) (*rawJob, error) {
 	if w.paused.Load() {
 		if opts.Block {
 			for w.paused.Load() && !w.closing.Load() {
 				select {
 				case <-w.pauseCh:
 				case <-time.After(100 * time.Millisecond):
-				case <-w.ctx.Done():
+				case <-ctx.Done():
 					return nil, nil
 				}
 			}
@@ -471,32 +510,50 @@ func (w *Worker[D, R]) getNextJob(token string, opts GetNextJobOptions) (*rawJob
 		return nil, nil
 	}
 
-	if w.drained.Load() && opts.Block && w.limitUntil.Load() == 0 {
-		jobID, err := w.waitForJob()
-		if err != nil {
-			if !w.paused.Load() && !w.closing.Load() {
-				return nil, fmt.Errorf("failed to wait for job: %w", err)
-			}
-			return nil, nil
-		}
-
-		if jobID == "" {
-			return nil, nil
-		}
-
-		return w.moveToActive(token, jobID)
-	}
-
-	if limitUntil := w.limitUntil.Load(); limitUntil != 0 {
-		if err := w.delay(limitUntil); err != nil {
+	if limitUntil := w.limitUntil.Load(); limitUntil > time.Now().UnixMilli() {
+		if err := w.delay(ctx, limitUntil); err != nil {
 			return nil, fmt.Errorf("failed to delay: %w", err)
 		}
 	}
-	return w.moveToActive(token, "")
+
+	if w.drained.Load() && opts.Block {
+		// One blocking read at a time (upstream this.waiting).
+		w.blockingFetch.Lock()
+		var jobID string
+		// Re-check under the guard: Pause/Close may have landed while this
+		// task waited for the previous blocking read to finish; starting a
+		// fresh BLMOVE then would keep pulling jobs during a pause or a
+		// Shutdown drain window.
+		if !w.paused.Load() && !w.closing.Load() {
+			var err error
+			jobID, err = w.waitForJob(ctx)
+			if err != nil {
+				w.blockingFetch.Unlock()
+				if !w.paused.Load() && !w.closing.Load() {
+					return nil, fmt.Errorf("failed to wait for job: %w", err)
+				}
+				return nil, nil
+			}
+		}
+		w.blockingFetch.Unlock()
+		if jobID == "" && (w.paused.Load() || w.closing.Load()) {
+			// Nothing was moved and we are pausing/closing: do not promote
+			// or lock new work. (A non-empty jobID was already moved by the
+			// BLMOVE server-side; locking it lets stalled recovery handle
+			// the boundary, same as upstream's disconnect race.)
+			return nil, nil
+		}
+		// A block timeout still proceeds to moveToActive: its Lua promotes
+		// due delayed jobs, the only mechanism by which an idle worker
+		// picks up delayed work.
+		return w.moveToActive(ctx, token, jobID)
+	}
+
+	return w.moveToActive(ctx, token, "")
 }
 
 // moveToActive moves the job to the active list.
-func (w *Worker[D, R]) moveToActive(token string, jobId string) (*rawJob, error) {
+func (w *Worker[D, R]) moveToActive(ctx context.Context, token string, jobId string) (*rawJob, error) {
 	if jobId != "" && len(jobId) > 2 && jobId[0:2] == "0:" {
 		blockUntil, err := strconv.Atoi(jobId[2:])
 		if err != nil {
@@ -518,12 +575,12 @@ func (w *Worker[D, R]) moveToActive(token string, jobId string) (*rawJob, error)
 		w.keyPrefix + "pc",
 	}
 
-	opts := map[string]interface{}{
+	opts := map[string]any{
 		"token":        token,
 		"lockDuration": int(w.opts.LockDuration / time.Millisecond),
 	}
 	if w.opts.Limiter != nil {
-		opts["limiter"] = map[string]interface{}{
+		opts["limiter"] = map[string]any{
 			"max":      w.opts.Limiter.Max,
 			"duration": w.opts.Limiter.Duration,
 		}
@@ -534,19 +591,19 @@ func (w *Worker[D, R]) moveToActive(token string, jobId string) (*rawJob, error)
 		return nil, fmt.Errorf("failed to marshal opts: %w", err)
 	}
 
-	rawResult, err := lua.MoveToActive(w.ctx, w.redisClient, keys, w.keyPrefix, time.Now().UnixMilli(), jobId, string(msgPackedOpts))
+	rawResult, err := lua.MoveToActive(ctx, w.redisClient, keys, w.keyPrefix, time.Now().UnixMilli(), jobId, string(msgPackedOpts))
 	if err != nil {
 		return nil, err
 	}
 
-	rawResultSlice, ok := rawResult.([]interface{})
+	rawResultSlice, ok := rawResult.([]any)
 	if !ok {
 		return nil, fmt.Errorf("unexpected type for rawResult: %T", rawResult)
 	}
 
 	result := raw2NextJobData(rawResultSlice)
 	if result == nil {
-		w.Emit("error", fmt.Sprintf("moveToActive received invalid data from Lua for token %s, jobID %s", token, jobId))
+		w.emit("error", fmt.Errorf("moveToActive received invalid data from Lua for token %s, jobID %s", token, jobId))
 		return nil, nil
 	}
 
@@ -554,11 +611,11 @@ func (w *Worker[D, R]) moveToActive(token string, jobId string) (*rawJob, error)
 		return nil, nil
 	}
 
-	return w.nextJobFromJobData(result.JobData, result.ID, result.LimitUntil, result.DelayUntil, token)
+	return w.nextJobFromJobData(ctx, result.JobData, result.ID, result.LimitUntil, result.DelayUntil, token)
 }
 
 // raw2NextJobData processes raw data and returns a typed nextJobData structure.
-func raw2NextJobData(raw []interface{}) *nextJobData {
+func raw2NextJobData(raw []any) *nextJobData {
 	if len(raw) < 4 {
 		return nil
 	}
@@ -584,27 +641,53 @@ func raw2NextJobData(raw []interface{}) *nextJobData {
 	return result
 }
 
-// waitForJob waits for a job ID from the wait list.
-func (w *Worker[D, R]) waitForJob() (string, error) {
+// waitForJob waits for a job ID from the wait list using the
+// BRPOPLPUSH-equivalent orientation (pop the oldest job from the right of
+// wait, push to the left of active). A block timeout returns "" without
+// error; Pause/Close abort the wait.
+func (w *Worker[D, R]) waitForJob(ctx context.Context) (string, error) {
 	blockTimeout := w.opts.DrainDelay
-	if blockTimeout <= 0 {
-		blockTimeout = 10 * time.Millisecond
-	}
 	if blockUntil := w.blockUntil.Load(); blockUntil > 0 {
-		remaining := time.Until(time.UnixMilli(blockUntil))
-		if remaining < 10*time.Millisecond {
-			remaining = 10 * time.Millisecond
-		}
-		blockTimeout = remaining
+		blockTimeout = time.Until(time.UnixMilli(blockUntil))
+	}
+	// go-redis only supports whole-second BLMOVE timeouts (and logs when
+	// truncating), so clamp to [1s, 10s].
+	if blockTimeout < time.Second {
+		blockTimeout = time.Second
 	}
 	if blockTimeout > 10*time.Second {
 		blockTimeout = 10 * time.Second
 	}
-	result, err := w.redisClient.BLMove(w.ctx, w.keyPrefix+"wait", w.keyPrefix+"active", "LEFT", "RIGHT", blockTimeout).Result()
+
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w.waitCancelMu.Lock()
+	w.waitCancel = cancel
+	w.waitCancelMu.Unlock()
+	defer func() {
+		w.waitCancelMu.Lock()
+		w.waitCancel = nil
+		w.waitCancelMu.Unlock()
+	}()
+
+	result, err := w.redisClient.BLMove(waitCtx, w.keyPrefix+"wait", w.keyPrefix+"active", "RIGHT", "LEFT", blockTimeout).Result()
 	if err != nil {
+		// Block timeout (redis.Nil) and an aborted wait are not errors.
+		if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
+			return "", nil
+		}
 		return "", err
 	}
 	return result, nil
+}
+
+// abortWait cancels an in-flight blocking read, if any.
+func (w *Worker[D, R]) abortWait() {
+	w.waitCancelMu.Lock()
+	if w.waitCancel != nil {
+		w.waitCancel()
+	}
+	w.waitCancelMu.Unlock()
 }
 
 // sleepContext sleeps for the specified duration or until context is cancelled.
@@ -624,17 +707,18 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 }
 
 // delay delays the execution for the specified time, respecting context cancellation.
-func (w *Worker[D, R]) delay(until int64) error {
+func (w *Worker[D, R]) delay(ctx context.Context, until int64) error {
 	now := time.Now().UnixMilli()
 	if until > now {
-		return sleepContext(w.ctx, time.Duration(until-now)*time.Millisecond)
+		return sleepContext(ctx, time.Duration(until-now)*time.Millisecond)
 	}
 	return nil
 }
 
 // nextJobFromJobData processes the next job data and returns a rawJob.
 func (w *Worker[D, R]) nextJobFromJobData(
-	jobData map[string]interface{},
+	ctx context.Context,
+	jobData map[string]any,
 	jobID string,
 	limitUntil int64,
 	delayUntil int64,
@@ -642,13 +726,19 @@ func (w *Worker[D, R]) nextJobFromJobData(
 ) (*rawJob, error) {
 	if jobData == nil {
 		if !w.drained.Load() {
-			w.Emit("drained")
+			w.emit("drained")
 			w.drained.Store(true)
 			w.blockUntil.Store(0)
 		}
 	}
 
-	w.limitUntil.Store(clampMin(limitUntil, 0))
+	// The Lua returns limitUntil as a relative PTTL; store an absolute
+	// deadline so delay() sleeps for the actual window.
+	if limitUntil > 0 {
+		w.limitUntil.Store(time.Now().UnixMilli() + limitUntil)
+	} else {
+		w.limitUntil.Store(0)
+	}
 	if delayUntil > 0 {
 		w.blockUntil.Store(clampMin(delayUntil, 0))
 	}
@@ -663,34 +753,42 @@ func (w *Worker[D, R]) nextJobFromJobData(
 		return nil, err
 	}
 	job.token = token
-	if job.opts.Repeat != nil && (job.opts.Repeat.Every != 0 || job.opts.Repeat.Pattern != "") {
-		// TODO: Repeatable.AddNextRepeatableJob
+	if job.opts.Repeat != nil {
+		// Schedule the next iteration at fetch time, before processing, so a
+		// failing iteration does not kill the chain. The existence check
+		// (skipCheckExists=false) lets RemoveRepeatable stop the chain.
+		// A scheduling failure aborts the fetch like upstream (the job stays
+		// in active for stalled recovery) instead of silently ending the chain.
+		jsonData, _ := job.data.(string)
+		if _, err := addNextRepeatableJobInternal(ctx, w.redisClient, w.keyPrefix, job.name, jsonData, job.opts, false); err != nil {
+			return nil, fmt.Errorf("failed to schedule next repeatable iteration for job %s: %w", job.id, err)
+		}
 	}
 	return &job, nil
 }
 
 // processJob processes the job.
 func (w *Worker[D, R]) processJob(job rawJob, token string, fetchNextCallback func() bool) (rawJob, error) {
-	if w.closing.Load() || w.paused.Load() {
+	if w.forceClosing.Load() {
+		w.untrackJob(job.id)
 		return rawJob{}, nil
 	}
 
-	w.Emit("active", job, "waiting")
+	w.trackJob(job)
+	defer w.untrackJob(job.id)
 
-	w.jobsInProgress.Lock()
-	w.jobsInProgress.jobs[job.id] = jobInProgress{job: job, ts: time.Now()}
-	w.jobsInProgress.Unlock()
+	w.emit("active", job, "waiting")
 
 	var result R
 	var err error
 
-	processFnCtx, processFnCtxCancel := context.WithCancel(w.ctx)
+	processFnCtx, processFnCtxCancel := context.WithCancel(w.runCtx)
 	defer processFnCtxCancel()
 
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				w.Emit("error", fmt.Sprintf("Panic recovered for job %s with token %s: %v", job.id, token, r))
+				w.emit("error", fmt.Errorf("panic recovered for job %s with token %s: %v", job.id, token, r))
 				err = fmt.Errorf("panic: %v", r)
 			}
 		}()
@@ -703,24 +801,41 @@ func (w *Worker[D, R]) processJob(job rawJob, token string, fetchNextCallback fu
 		result, err = w.processFn(processFnCtx, typedJob)
 	}()
 
-	w.jobsInProgress.Lock()
-	delete(w.jobsInProgress.jobs, job.id)
-	w.jobsInProgress.Unlock()
-
 	if err != nil {
-		return w.handleJobError(job, token, err, fetchNextCallback)
+		return w.handleJobError(job, token, err)
 	}
 
 	return w.handleJobSuccess(job, token, result, fetchNextCallback)
 }
 
-// handleJobError handles the error path of processJob.
-func (w *Worker[D, R]) handleJobError(job rawJob, token string, err error, fetchNextCallback func() bool) (rawJob, error) {
+func (w *Worker[D, R]) trackJob(job rawJob) {
+	if job.id == "" || job.id == "0" {
+		return
+	}
+	w.jobsInProgress.Lock()
+	if _, exists := w.jobsInProgress.jobs[job.id]; !exists {
+		w.jobsInProgress.jobs[job.id] = jobInProgress{job: job, ts: time.Now()}
+	}
+	w.jobsInProgress.Unlock()
+}
+
+func (w *Worker[D, R]) untrackJob(jobID string) {
+	if jobID == "" || jobID == "0" {
+		return
+	}
+	w.jobsInProgress.Lock()
+	delete(w.jobsInProgress.jobs, jobID)
+	w.jobsInProgress.Unlock()
+}
+
+// handleJobError handles the error path of processJob. The fail path never
+// prefetches (upstream job.moveToFailed defaults fetchNext to false).
+func (w *Worker[D, R]) handleJobError(job rawJob, token string, err error) (rawJob, error) {
 	if errors.Is(err, ErrRateLimit) {
 		if w.scripts != nil {
-			pttl, mErr := w.scripts.moveJobFromActiveToWait(w.ctx, job.id, token)
+			pttl, mErr := w.scripts.moveJobFromActiveToWait(w.runCtx, job.id, token)
 			if mErr != nil {
-				w.Emit("error", fmt.Sprintf("moveJobFromActiveToWait failed for %s: %v", job.id, mErr))
+				w.emit("error", fmt.Errorf("moveJobFromActiveToWait failed for %s: %v", job.id, mErr))
 			} else {
 				w.limitUntil.Store(time.Now().Add(time.Duration(pttl) * time.Millisecond).UnixMilli())
 			}
@@ -732,87 +847,91 @@ func (w *Worker[D, R]) handleJobError(job rawJob, token string, err error, fetch
 		return rawJob{}, err
 	}
 
-	shouldMoveToFailed := false
-
-	if job.attemptsMade < job.opts.Attempts {
-		delayMs := 0
-		if w.opts.BackoffStrategy != nil {
-			delayMs = w.opts.BackoffStrategy(job.attemptsMade, job.opts.Backoff, err, job.id)
-		} else if job.opts.Backoff != nil {
-			delayMs = backoffutil.Calculate(backoffutil.Options{Type: job.opts.Backoff.Type, Delay: job.opts.Backoff.Delay}, job.attemptsMade)
-		} else if w.opts.Backoff != nil {
-			delayMs = backoffutil.Calculate(backoffutil.Options{Type: w.opts.Backoff.Type, Delay: w.opts.Backoff.Delay}, job.attemptsMade)
-		}
-
-		if delayMs > 0 {
-			keys, args := w.scripts.moveToDelayedArgs(job.id, time.Now().UnixMilli()+int64(delayMs), token)
-			if _, derr := lua.MoveToDelayed(w.ctx, w.redisClient, keys, args...); derr != nil {
-				w.Emit("error", fmt.Sprintf("moveToDelayed failed for %s: %v", job.id, derr))
-				keysR, argsR := w.scripts.retryJobArgs(job.id, job.opts.Lifo, token)
-				if _, rerr := lua.RetryJob(w.ctx, w.redisClient, keysR, argsR...); rerr != nil {
-					w.Emit("error", fmt.Sprintf("retryJob failed for %s: %v", job.id, rerr))
-					shouldMoveToFailed = true
-				} else {
-					w.Emit("failed", job, err, "active")
-					return rawJob{}, err
-				}
-			} else {
-				w.Emit("failed", job, err, "active")
-				return rawJob{}, err
-			}
-		} else if delayMs == 0 {
-			keys, args := w.scripts.retryJobArgs(job.id, job.opts.Lifo, token)
-			if _, rerr := lua.RetryJob(w.ctx, w.redisClient, keys, args...); rerr != nil {
-				w.Emit("error", fmt.Sprintf("retryJob failed for %s: %v", job.id, rerr))
-				shouldMoveToFailed = true
-			} else {
-				w.Emit("failed", job, err, "active")
-				return rawJob{}, err
-			}
-		} else {
-			shouldMoveToFailed = true
-		}
-	} else {
-		shouldMoveToFailed = true
-	}
-
-	if shouldMoveToFailed {
-		if job.opts.Attempts > 0 && job.attemptsMade >= job.opts.Attempts {
-			w.Emit("retries-exhausted", job, err)
-		}
-		var removeOnFail KeepJobs
-		if w.opts.RemoveOnFail != nil {
-			removeOnFail = *w.opts.RemoveOnFail
-		}
-		lockDurationMs := int(w.opts.LockDuration / time.Millisecond)
-		maxMetricsSize := ""
-		if w.opts.Metrics != nil && w.opts.Metrics.MaxDataPoints > 0 {
-			maxMetricsSize = strconv.Itoa(w.opts.Metrics.MaxDataPoints)
-		}
-		if moveErr := jobMoveToFailed(w.ctx, w.scripts, &job, err, token, removeOnFail, fetchNextCallback(), lockDurationMs, maxMetricsSize); moveErr != nil {
-			w.Emit("error", fmt.Sprintf("Error explicitly moving job %s to failed: %v", job.id, moveErr))
-		}
-		w.Emit("failed", job, err, "active")
+	// failedReason and the stacktrace are persisted atomically with the state
+	// move below, like upstream's single multi in job.moveToFailed.
+	stacktrace, stErr := job.prepareStacktrace(err)
+	if stErr != nil {
+		w.emit("error", fmt.Errorf("failed to marshal stacktrace for job %s: %v", job.id, stErr))
 		return rawJob{}, err
 	}
 
+	// An automatic retry is performed unless attempts are exhausted, the job
+	// was discarded, or the error is marked unrecoverable (upstream job.ts:622).
+	if job.attemptsMade < job.opts.Attempts && !job.discarded && !errors.Is(err, ErrUnrecoverable) {
+		// The job's own backoff wins; WorkerOptions.Backoff is the default for
+		// jobs without one (like queue defaultJobOptions.backoff upstream).
+		backoff := job.opts.Backoff
+		if backoff == nil {
+			backoff = w.opts.Backoff
+		}
+		delayMs := 0
+		if backoff != nil {
+			if w.opts.BackoffStrategy != nil && !backoffutil.IsBuiltin(backoff.Type) {
+				// Custom strategies handle non-builtin types, like upstream
+				// settings.backoffStrategy in lookupStrategy.
+				delayMs = w.opts.BackoffStrategy(job.attemptsMade, backoff, err, job.id)
+			} else {
+				var backoffErr error
+				delayMs, backoffErr = backoffutil.Calculate(backoffutil.Options{Type: backoff.Type, Delay: backoff.Delay}, job.attemptsMade)
+				if backoffErr != nil {
+					// Upstream throws before any Redis write: the job stays in
+					// active and the stalled checker recovers it.
+					w.emit("error", fmt.Errorf("backoff calculation failed for job %s: %v", job.id, backoffErr))
+					return rawJob{}, err
+				}
+			}
+		}
+		if delayMs >= 0 {
+			var opErr error
+			jobKey := w.keyPrefix + job.id
+			if delayMs > 0 {
+				keys, args := w.scripts.moveToDelayedArgs(job.id, time.Now().UnixMilli()+int64(delayMs), token)
+				result, derr := runFailureMulti(w.runCtx, w.redisClient, jobKey, stacktrace, job.failedReason, lua.MoveToDelayedScript, keys, args)
+				opErr = derr
+				if opErr == nil {
+					if code, ok := result.(int64); ok && code < 0 {
+						opErr = finishedErrors(code, job.id, "moveToDelayed")
+					}
+				}
+			} else {
+				keys, args := w.scripts.retryJobArgs(job.id, job.opts.Lifo, token)
+				result, rerr := runFailureMulti(w.runCtx, w.redisClient, jobKey, stacktrace, job.failedReason, lua.RetryJobScript, keys, args)
+				opErr = rerr
+				if opErr == nil {
+					if code, ok := result.(int64); ok && code < 0 {
+						opErr = finishedErrors(code, job.id, "retryJob")
+					}
+				}
+			}
+			if opErr != nil {
+				// Like upstream handleFailed's catch: emit only; a worker will
+				// (or already has) recover the job through the stalled path.
+				w.emit("error", fmt.Errorf("failed to schedule retry for job %s: %v", job.id, opErr))
+				return rawJob{}, err
+			}
+			w.emit("failed", job, err, "active")
+			return rawJob{}, err
+		}
+		// delayMs < 0: the strategy vetoed the retry; fall through to failed.
+	}
+
+	if job.opts.Attempts > 0 && job.attemptsMade >= job.opts.Attempts {
+		w.emit("retries-exhausted", job, err)
+	}
+	lockDurationMs := int(w.opts.LockDuration / time.Millisecond)
+	maxMetricsSize := ""
+	if w.opts.Metrics != nil && w.opts.Metrics.MaxDataPoints > 0 {
+		maxMetricsSize = strconv.Itoa(w.opts.Metrics.MaxDataPoints)
+	}
+	if moveErr := jobMoveToFailed(w.runCtx, w.scripts, &job, stacktrace, token, false, lockDurationMs, maxMetricsSize); moveErr != nil {
+		w.emit("error", fmt.Errorf("error explicitly moving job %s to failed: %v", job.id, moveErr))
+	}
+	w.emit("failed", job, err, "active")
 	return rawJob{}, err
 }
 
 // handleJobSuccess handles the success path of processJob.
 func (w *Worker[D, R]) handleJobSuccess(job rawJob, token string, result R, fetchNextCallback func() bool) (rawJob, error) {
-	// Check if this is a repeatable job and schedule the next one
-	if job.opts.Repeat != nil {
-		jobJSONData, ok := job.data.(string)
-		if !ok {
-			w.Emit("error", fmt.Sprintf("Repeatable job %s has non-string data (%T), cannot reschedule", job.id, job.data))
-		} else {
-			if scheduleErr := scheduleNextRepeatableJobInternal(w.ctx, w.redisClient, w.keyPrefix, job.name, jobJSONData, job.opts); scheduleErr != nil {
-				w.Emit("error", fmt.Sprintf("Failed to schedule next instance for repeatable job %s: %v", job.id, scheduleErr))
-			}
-		}
-	}
-
 	lockDurationMs := int(w.opts.LockDuration / time.Millisecond)
 	maxMetricsSize := ""
 	if w.opts.Metrics != nil && w.opts.Metrics.MaxDataPoints > 0 {
@@ -822,58 +941,45 @@ func (w *Worker[D, R]) handleJobSuccess(job rawJob, token string, result R, fetc
 	job.returnValue = result
 	stringifiedReturnValue, marshalErr := json.Marshal(result)
 	if marshalErr != nil {
-		w.Emit("error", fmt.Sprintf("Error marshaling result for job %s: %v", job.id, marshalErr))
+		w.emit("error", fmt.Errorf("error marshaling result for job %s: %v", job.id, marshalErr))
 		return rawJob{}, marshalErr
 	}
 
-	getNext := fetchNextCallback() && !(w.closing.Load() || w.paused.Load())
+	getNext := fetchNextCallback() && !w.closing.Load() && !w.paused.Load()
 	keys, args, scriptErr := w.scripts.moveToFinishedArgs(&job, string(stringifiedReturnValue), "returnvalue", job.opts.RemoveOnComplete, "completed", token, time.Now(), getNext, lockDurationMs, maxMetricsSize)
 	if scriptErr != nil {
-		w.Emit("error", fmt.Sprintf("Error moving job to completed: %v", scriptErr))
+		w.emit("error", fmt.Errorf("error moving job to completed: %v", scriptErr))
 		return rawJob{}, scriptErr
 	}
 
 	job.finishedOn = time.Now()
-	rawLuaResult, luaErr := lua.MoveToFinished(w.ctx, w.redisClient, keys, args...)
+	rawLuaResult, luaErr := lua.MoveToFinished(w.runCtx, w.redisClient, keys, args...)
 	if luaErr != nil {
-		w.Emit("error", fmt.Sprintf("Error moving job to completed: %v", luaErr))
+		w.emit("error", fmt.Errorf("error moving job to completed: %v", luaErr))
 		return rawJob{}, luaErr
 	}
 
-	var completed []interface{}
+	var completed []any
 	switch v := rawLuaResult.(type) {
 	case int64:
-		completed = []interface{}{v}
-	case []interface{}:
+		completed = []any{v}
+	case []any:
 		completed = v
 	default:
 		return rawJob{}, fmt.Errorf("unexpected type for rawResult: %T", rawLuaResult)
 	}
 
 	if code, ok := completed[0].(int64); ok && code < 0 {
-		switch code {
-		case -1:
-			return rawJob{}, fmt.Errorf("missing key for job %s: %d", job.id, completed)
-		case -2:
-			return rawJob{}, fmt.Errorf("missing lock for job %s: %d", job.id, completed)
-		case -3:
-			return rawJob{}, fmt.Errorf("not in active set for job %s: %d", job.id, completed)
-		case -4:
-			return rawJob{}, fmt.Errorf("has pending dependencies for job %s: %d", job.id, completed)
-		case -6:
-			return rawJob{}, fmt.Errorf("lock is not owned by this client for job %s: %d", job.id, completed)
-		default:
-			return rawJob{}, fmt.Errorf("unknown error for job %s: %d", job.id, completed)
-		}
+		return rawJob{}, finishedErrors(code, job.id, "moveToFinished")
 	}
 
-	w.Emit("completed", job, result, "active")
+	w.emit("completed", job, result, "active")
 
 	nextData := raw2NextJobData(completed)
 	if nextData != nil {
-		j, nextErr := w.nextJobFromJobData(nextData.JobData, nextData.ID, nextData.LimitUntil, nextData.DelayUntil, token)
+		j, nextErr := w.nextJobFromJobData(w.runCtx, nextData.JobData, nextData.ID, nextData.LimitUntil, nextData.DelayUntil, token)
 		if nextErr != nil {
-			w.Emit("error", fmt.Sprintf("Error getting next job: %v", nextErr))
+			w.emit("error", fmt.Errorf("error getting next job: %v", nextErr))
 			return rawJob{}, nextErr
 		}
 		if j != nil {
@@ -883,14 +989,60 @@ func (w *Worker[D, R]) handleJobSuccess(job rawJob, token string, result R, fetc
 	return rawJob{}, nil
 }
 
-// Pause pauses processing of this worker.
+// NextJob manually fetches the next waiting job and moves it to active,
+// for workers used without Run() (upstream's manual processing pattern).
+// token identifies the lock owner and must be passed to the job's
+// MoveToCompleted/MoveToFailed calls (the returned job carries it).
+// Returns nil when no job is available.
+func (w *Worker[D, R]) NextJob(ctx context.Context, token string) (*Job[D], error) {
+	raw, err := w.getNextJob(ctx, token, nextJobOptions{Block: false})
+	if err != nil || raw == nil {
+		return nil, err
+	}
+	raw.token = token
+	return wrapRawJob[D](raw)
+}
+
+// RateLimit overrides the rate limit to be active for the given duration,
+// mirroring upstream worker.rateLimit(expireTimeMs). A processor typically
+// calls this and then returns ErrRateLimit.
+func (w *Worker[D, R]) RateLimit(ctx context.Context, d time.Duration) error {
+	const maxSafeInteger = int64(9007199254740991) // Number.MAX_SAFE_INTEGER
+	return w.redisClient.Set(ctx, w.keyPrefix+"limiter", maxSafeInteger, d).Err()
+}
+
+// Pause pauses processing of this worker immediately: no new jobs are
+// fetched, but jobs already in progress keep running. Use PauseAndWait to
+// also wait for in-flight jobs to finish.
 func (w *Worker[D, R]) Pause() {
-	if w.paused.Load() {
+	if !w.paused.CompareAndSwap(false, true) {
 		return
 	}
 
-	w.paused.Store(true)
-	w.Emit("paused")
+	// Abort an in-flight blocking read so a paused worker does not pull a
+	// new job into active (upstream disconnects the blocking connection).
+	w.abortWait()
+	w.emit("paused")
+}
+
+// PauseAndWait pauses the worker and blocks until all jobs in progress have
+// finished or ctx is done, like upstream worker.pause(). It returns ctx.Err()
+// when the wait is cut short.
+func (w *Worker[D, R]) PauseAndWait(ctx context.Context) error {
+	w.Pause()
+	for {
+		w.jobsInProgress.Lock()
+		n := len(w.jobsInProgress.jobs)
+		w.jobsInProgress.Unlock()
+		if n == 0 || w.closing.Load() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 // Resume resumes processing of this worker (if paused).
@@ -904,7 +1056,7 @@ func (w *Worker[D, R]) Resume() {
 	case w.pauseCh <- struct{}{}:
 	default:
 	}
-	w.Emit("resumed")
+	w.emit("resumed")
 }
 
 // IsPaused returns true if the worker is paused.
@@ -932,97 +1084,161 @@ func (w *Worker[D, R]) Wait() {
 	w.wg.Wait()
 }
 
-// Close closes the worker gracefully with timeout.
+// Close closes the worker immediately: in-flight jobs are abandoned (their
+// process contexts are cancelled) and no waiting is done, like upstream
+// worker.close(true). Use Shutdown for a graceful, bounded close.
+// Close is idempotent.
 func (w *Worker[D, R]) Close() error {
-	w.mutex.Lock()
-
-	if w.closing.Load() {
-		w.mutex.Unlock()
+	if !w.closing.CompareAndSwap(false, true) {
 		return nil
 	}
+	w.forceClosing.Store(true)
 
-	w.closing.Store(true)
+	w.abortWait()
 
+	w.mutex.Lock()
 	if w.cancel != nil {
 		w.cancel()
 	}
+	w.stopTimers()
+	w.mutex.Unlock()
+	w.wg.Wait()
 
+	// Release the fifoqueue's pool goroutines; without this every closed
+	// worker would leak Concurrency parked goroutines.
+	if w.asyncFifoQueue != nil {
+		_ = w.asyncFifoQueue.WaitAll(minQueueCleanupTimeout)
+	}
+
+	w.running.Store(false)
+	// Emitted once close completes, like upstream worker.close()'s finally.
+	w.emit("closed")
+	return nil
+}
+
+// Shutdown closes the worker gracefully: it stops fetching new jobs, then
+// waits for the jobs in progress to finish before cancelling the worker's
+// run context, bounded by ctx. When ctx is done first, the remaining jobs
+// are abandoned and the returned error wraps ErrShutdownTimeout and
+// ctx.Err(). Shutdown is idempotent.
+func (w *Worker[D, R]) Shutdown(ctx context.Context) error {
+	if !w.closing.CompareAndSwap(false, true) {
+		return nil
+	}
+	// Emitted once close completes, like upstream worker.close()'s finally.
+	defer w.emit("closed")
+
+	// closing stops new fetches; abort the in-flight blocking read too.
+	w.abortWait()
+
+	// Drain the complete owned-job and FIFO lifecycle before cancelling runCtx
+	// so fetched, queued, processing, and finalizing jobs all settle.
+	var drainErr error
+	for {
+		w.jobsInProgress.Lock()
+		n := len(w.jobsInProgress.jobs)
+		w.jobsInProgress.Unlock()
+		queued := 0
+		if w.asyncFifoQueue != nil {
+			queued = w.asyncFifoQueue.NumTotal()
+		}
+		if n == 0 && queued == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			drainErr = fmt.Errorf("%w: %d owned job(s), %d queued task(s): %w", ErrShutdownTimeout, n, queued, ctx.Err())
+		case <-time.After(50 * time.Millisecond):
+		}
+		if drainErr != nil {
+			break
+		}
+	}
+	if drainErr != nil {
+		w.forceClosing.Store(true)
+	} else {
+		// The coordinator exits once closing is set and the FIFO is empty.
+		w.wg.Wait()
+	}
+
+	w.mutex.Lock()
+	if w.cancel != nil {
+		w.cancel()
+	}
+	w.stopTimers()
+	w.mutex.Unlock()
+	if drainErr != nil {
+		w.wg.Wait()
+	}
+
+	var queueErr error
+	if w.asyncFifoQueue != nil {
+		if err := w.asyncFifoQueue.WaitAll(minQueueCleanupTimeout); err != nil {
+			queueErr = fmt.Errorf("failed to close FIFO queue: %w", err)
+		}
+	}
+
+	w.running.Store(false)
+	return errors.Join(drainErr, queueErr)
+}
+
+// stopTimers stops the stalled-check and lock-extender timers, if running.
+func (w *Worker[D, R]) stopTimers() {
 	if w.stalledCheckTimer != nil {
 		w.stalledCheckTimer.Stop()
 	}
 	if w.extendLocksTimer != nil {
 		w.extendLocksTimer.Stop()
 	}
-
-	timeout := w.opts.ShutdownTimeout
-	w.mutex.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		w.wg.Wait()
-		close(done)
-	}()
-
-	var timedOut bool
-	select {
-	case <-done:
-	case <-time.After(timeout):
-		w.Emit("error", fmt.Errorf("worker shutdown timed out after %v", timeout))
-		timedOut = true
-	}
-
-	var queueErr error
-	if w.asyncFifoQueue != nil {
-		queueTimeout := timeout / 2
-		if queueTimeout < minQueueCleanupTimeout {
-			queueTimeout = minQueueCleanupTimeout
-		}
-		if err := w.asyncFifoQueue.WaitAll(queueTimeout); err != nil {
-			queueErr = fmt.Errorf("failed to close FIFO queue: %w", err)
-		}
-	}
-
-	if timedOut && queueErr != nil {
-		return errors.Join(fmt.Errorf("worker shutdown timed out after %v", timeout), queueErr)
-	}
-	if timedOut {
-		return fmt.Errorf("worker shutdown timed out after %v", timeout)
-	}
-	if queueErr != nil {
-		return queueErr
-	}
-	return nil
 }
 
-// startStalledCheckTimer starts the stalled check timer.
+// startStalledCheckTimer runs a stalled check immediately (upstream checks
+// on start, so a restarted worker recovers stalled jobs right away), then
+// reschedules itself every StalledInterval.
 func (w *Worker[D, R]) startStalledCheckTimer() {
 	if w.closing.Load() || w.opts.SkipStalledCheck {
 		return
 	}
-	w.stalledCheckTimer = time.AfterFunc(w.opts.StalledInterval, func() {
-		if w.closing.Load() || w.opts.SkipStalledCheck {
-			return
-		}
-		if err := w.moveStalledJobsToWait(); err != nil {
-			w.Emit("error", err)
-		}
-		w.startStalledCheckTimer()
-	})
+	if err := w.moveStalledJobsToWait(); err != nil {
+		w.emit("error", err)
+	}
+	// The timer field is read by stopTimers under w.mutex; write it under
+	// the same mutex (this callback runs on a timer goroutine).
+	w.mutex.Lock()
+	if !w.closing.Load() {
+		w.stalledCheckTimer = time.AfterFunc(w.opts.StalledInterval, func() {
+			w.startStalledCheckTimer()
+		})
+	}
+	w.mutex.Unlock()
 }
 
 // startLockExtender starts the lock extender.
 func (w *Worker[D, R]) startLockExtender() {
-	if w.closing.Load() || w.opts.SkipLockRenewal {
+	if w.forceClosing.Load() || w.opts.SkipLockRenewal || w.runCtx == nil {
 		return
 	}
+	select {
+	case <-w.runCtx.Done():
+		return
+	default:
+	}
+	w.mutex.Lock()
 	w.extendLocksTimer = time.AfterFunc(w.opts.LockRenewTime/2, func() {
-		w.jobsInProgress.Lock()
-		defer w.jobsInProgress.Unlock()
-		if w.closing.Load() || w.opts.SkipLockRenewal {
+		if w.forceClosing.Load() || w.opts.SkipLockRenewal {
 			return
 		}
+		select {
+		case <-w.runCtx.Done():
+			return
+		default:
+		}
+		// Collect under the lock, extend after releasing it: extending emits
+		// error events, and a listener calling PauseAndWait/Shutdown (which
+		// poll jobsInProgress) must not deadlock against this goroutine.
 		now := time.Now()
 		var jobsToExtend []*rawJob
+		w.jobsInProgress.Lock()
 		for id, jp := range w.jobsInProgress.jobs {
 			if jp.ts.IsZero() {
 				jp.ts = now
@@ -1032,32 +1248,35 @@ func (w *Worker[D, R]) startLockExtender() {
 			if jp.ts.Add(w.opts.LockRenewTime / 2).Before(now) {
 				jp.ts = now
 				w.jobsInProgress.jobs[id] = jp
-				jobsToExtend = append(jobsToExtend, &jp.job)
+				job := jp.job
+				jobsToExtend = append(jobsToExtend, &job)
 			}
 		}
+		w.jobsInProgress.Unlock()
 		if len(jobsToExtend) > 0 {
 			if err := w.extendLocksForJobs(jobsToExtend); err != nil {
-				w.Emit("error", err)
+				w.emit("error", err)
 			}
 		}
 		w.startLockExtender()
 	})
+	w.mutex.Unlock()
 }
 
 // retryIfFailed retries a job if it failed, respecting context cancellation.
 func (w *Worker[D, R]) retryIfFailed(jobFunc func() (*rawJob, error), delay time.Duration) (rawJob, error) {
 	for {
 		select {
-		case <-w.ctx.Done():
-			return rawJob{}, w.ctx.Err()
+		case <-w.runCtx.Done():
+			return rawJob{}, w.runCtx.Err()
 		default:
 		}
 
 		nextJob, err := jobFunc()
 		if err != nil {
-			w.Emit("error", err)
+			w.emit("error", err)
 			if delay > 0 {
-				if err := sleepContext(w.ctx, delay); err != nil {
+				if err := sleepContext(w.runCtx, delay); err != nil {
 					return rawJob{}, err
 				}
 				continue
@@ -1065,12 +1284,8 @@ func (w *Worker[D, R]) retryIfFailed(jobFunc func() (*rawJob, error), delay time
 			return rawJob{}, err
 		}
 		if nextJob == nil {
-			if delay > 0 {
-				if err := sleepContext(w.ctx, delay); err != nil {
-					return rawJob{}, err
-				}
-				continue
-			}
+			// No job available: return immediately like upstream; the
+			// blocking wait in getNextJob provides the pacing.
 			return rawJob{}, nil
 		}
 		return *nextJob, nil
@@ -1082,10 +1297,15 @@ func (w *Worker[D, R]) retryIfFailed(jobFunc func() (*rawJob, error), delay time
 func (w *Worker[D, R]) extendLocksForJobs(jobs []*rawJob) error {
 	var errs []error
 	for _, job := range jobs {
-		keys := []string{w.keyPrefix + "lock", w.keyPrefix + "stalled"}
-		_, err := lua.ExtendLock(w.ctx, w.redisClient, keys, job.token, int(w.opts.LockDuration/time.Millisecond), job.id)
+		keys := []string{w.keyPrefix + job.id + ":lock", w.keyPrefix + "stalled"}
+		result, err := lua.ExtendLock(w.runCtx, w.redisClient, keys, job.token, int(w.opts.LockDuration/time.Millisecond), job.id)
+		if err == nil {
+			if n, ok := result.(int64); ok && n == 0 {
+				err = ErrMissingLock
+			}
+		}
 		if err != nil {
-			w.Emit("error", fmt.Errorf("could not renew lock for job %s: %w", job.id, err))
+			w.emit("error", fmt.Errorf("could not renew lock for job %s: %w", job.id, err))
 			errs = append(errs, fmt.Errorf("job %s: %w", job.id, err))
 		}
 	}
@@ -1095,18 +1315,23 @@ func (w *Worker[D, R]) extendLocksForJobs(jobs []*rawJob) error {
 // moveStalledJobsToWait moves stalled jobs to the wait list.
 func (w *Worker[D, R]) moveStalledJobsToWait() error {
 	chunkSize := 50
-	failed, stalled, err := func() (failed []string, stalled []string, error error) {
+	parentData, err := w.loadStalledParentData()
+	if err != nil {
+		return err
+	}
+	timestamp := time.Now().UnixMilli()
+	failed, stalled, err := func() (failed []string, stalled []string, err error) {
 		keys := []string{w.keyPrefix + "stalled", w.keyPrefix + "wait", w.keyPrefix + "active", w.keyPrefix + "failed", w.keyPrefix + "stalled-check", w.keyPrefix + "meta", w.keyPrefix + "paused", w.keyPrefix + "events"}
-		result, err := lua.MoveStalledJobsToWait(w.ctx, w.redisClient, keys, w.opts.MaxStalledCount, w.keyPrefix, time.Now().Unix(), int(w.opts.StalledInterval/time.Millisecond))
+		result, err := lua.MoveStalledJobsToWait(w.runCtx, w.redisClient, keys, w.opts.MaxStalledCount, w.keyPrefix, timestamp, int(w.opts.StalledInterval/time.Millisecond))
 		if err != nil {
 			return nil, nil, err
 		}
-		resultSlice, ok := result.([]interface{})
+		resultSlice, ok := result.([]any)
 		if !ok || len(resultSlice) != 2 {
 			return nil, nil, fmt.Errorf("unexpected Lua script result format")
 		}
 
-		failedInterfaces, ok := resultSlice[0].([]interface{})
+		failedInterfaces, ok := resultSlice[0].([]any)
 		if !ok {
 			return nil, nil, fmt.Errorf("failed jobs format incorrect")
 		}
@@ -1119,7 +1344,7 @@ func (w *Worker[D, R]) moveStalledJobsToWait() error {
 			}
 		}
 
-		stalledInterfaces, ok := resultSlice[1].([]interface{})
+		stalledInterfaces, ok := resultSlice[1].([]any)
 		if !ok {
 			return nil, nil, fmt.Errorf("stalled jobs format incorrect")
 		}
@@ -1139,12 +1364,18 @@ func (w *Worker[D, R]) moveStalledJobsToWait() error {
 	}
 
 	for _, jobId := range stalled {
-		w.Emit("stalled", jobId, "active")
+		w.emit("stalled", jobId, "active")
+	}
+	for _, jobID := range failed {
+		data := parentData[jobID]
+		if err := lua.HandleStalledParent(w.runCtx, w.redisClient, w.keyPrefix+jobID, timestamp, data.opts, data.parentKey, data.parent); err != nil {
+			return err
+		}
 	}
 
 	failedJobs := make([]rawJob, 0, len(failed))
 	for i, jobId := range failed {
-		j, err := jobFromId(w.ctx, w.redisClient, w.keyPrefix, jobId)
+		j, err := jobFromId(w.runCtx, w.redisClient, w.keyPrefix, jobId)
 		if err != nil {
 			if errors.Is(err, ErrJobNotFound) {
 				continue
@@ -1164,10 +1395,50 @@ func (w *Worker[D, R]) moveStalledJobsToWait() error {
 	return nil
 }
 
+type stalledParentData struct {
+	opts      string
+	parentKey string
+	parent    string
+}
+
+func (w *Worker[D, R]) loadStalledParentData() (map[string]stalledParentData, error) {
+	jobIDs, err := w.redisClient.SMembers(w.runCtx, w.keyPrefix+"stalled").Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read stalled job metadata: %w", err)
+	}
+	data := make(map[string]stalledParentData, len(jobIDs))
+	if len(jobIDs) == 0 {
+		return data, nil
+	}
+	pipe := w.redisClient.Pipeline()
+	commands := make(map[string]*redis.SliceCmd, len(jobIDs))
+	for _, jobID := range jobIDs {
+		commands[jobID] = pipe.HMGet(w.runCtx, w.keyPrefix+jobID, "opts", "parentKey", "parent")
+	}
+	if _, err := pipe.Exec(w.runCtx); err != nil && !errors.Is(err, redis.Nil) {
+		return nil, fmt.Errorf("failed to load stalled job metadata: %w", err)
+	}
+	for jobID, command := range commands {
+		values := command.Val()
+		entry := stalledParentData{}
+		if len(values) > 0 && values[0] != nil {
+			entry.opts, _ = values[0].(string)
+		}
+		if len(values) > 1 && values[1] != nil {
+			entry.parentKey, _ = values[1].(string)
+		}
+		if len(values) > 2 && values[2] != nil {
+			entry.parent, _ = values[2].(string)
+		}
+		data[jobID] = entry
+	}
+	return data, nil
+}
+
 // notifyFailedJobs emits a failed event for each job in the provided list.
 func (w *Worker[D, R]) notifyFailedJobs(jobs []rawJob) {
 	for _, job := range jobs {
-		w.Emit("failed", job, errors.New("job stalled more than allowable limit"), "active")
+		w.emit("failed", job, errors.New("job stalled more than allowable limit"), "active")
 	}
 }
 

@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ReprocessJob executes the Lua script reprocessJob on Redis with 6 keys.
-func ReprocessJob(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 6 {
-		return nil, fmt.Errorf("expected 6 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// ReprocessJobScript is the reprocessJob script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var ReprocessJobScript = redis.NewScript(`--[[
   Attempts to reprocess a job
   Input:
     KEYS[1] job key
@@ -59,8 +56,14 @@ if (rcall("EXISTS", KEYS[1]) == 1) then
 else
   return -1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// ReprocessJob executes the Lua script reprocessJob on Redis with 6 keys.
+func ReprocessJob(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 6 {
+		return nil, fmt.Errorf("expected 6 keys but got %d", len(keys))
+	}
+	result, err := ReprocessJobScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

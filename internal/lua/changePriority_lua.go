@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ChangePriority executes the Lua script changePriority on Redis with 5 keys.
-func ChangePriority(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 5 {
-		return nil, fmt.Errorf("expected 5 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// ChangePriorityScript is the changePriority script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var ChangePriorityScript = redis.NewScript(`--[[
   Change job priority
   Input:
     KEYS[1] 'wait',
@@ -90,8 +87,14 @@ if rcall("EXISTS", jobKey) == 1 then
 else
   return -1
 end
-`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+`)
+
+// ChangePriority executes the Lua script changePriority on Redis with 5 keys.
+func ChangePriority(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 5 {
+		return nil, fmt.Errorf("expected 5 keys but got %d", len(keys))
+	}
+	result, err := ChangePriorityScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

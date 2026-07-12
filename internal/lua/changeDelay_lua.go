@@ -8,12 +8,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ChangeDelay executes the Lua script changeDelay on Redis with 3 keys.
-func ChangeDelay(ctx context.Context, client redis.Cmdable, keys []string, args ...interface{}) (interface{}, error) {
-	if len(keys) != 3 {
-		return nil, fmt.Errorf("expected 3 keys but got %d", len(keys))
-	}
-	luaScript := `--[[
+// ChangeDelayScript is the changeDelay script, exported so callers can
+// run it inside pipelines/transactions (EVALSHA after Load).
+var ChangeDelayScript = redis.NewScript(`--[[
   Change job delay when it is in delayed set.
   Input:
     KEYS[1] delayed key
@@ -44,8 +41,14 @@ if rcall("EXISTS", KEYS[2]) == 1 then
   return 0
 else
   return -1
-end`
-	result, err := client.Eval(ctx, luaScript, keys, args...).Result()
+end`)
+
+// ChangeDelay executes the Lua script changeDelay on Redis with 3 keys.
+func ChangeDelay(ctx context.Context, client redis.Cmdable, keys []string, args ...any) (any, error) {
+	if len(keys) != 3 {
+		return nil, fmt.Errorf("expected 3 keys but got %d", len(keys))
+	}
+	result, err := ChangeDelayScript.Run(ctx, client, keys, args...).Result()
 	if err != nil {
 		return nil, err
 	}

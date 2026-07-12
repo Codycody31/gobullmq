@@ -1,279 +1,308 @@
-
 # BullMQ for Golang
 
-BullMQ for Golang is a powerful and flexible job queue library that allows you to manage and process jobs using Redis. It provides a robust set of features for creating, processing, and managing jobs in a distributed environment.
+BullMQ for Golang is a Redis-backed job queue compatible with [BullMQ](https://github.com/taskforcesh/bullmq). Go and Node.js processes can produce and consume jobs on the same queues.
 
-## Supported Versions
+## BullMQ compatibility
 
-- BullMQ v4.12.2 - The current version of gobullmq is based on/compatible with BullMQ v4.12.2.
+The embedded Lua scripts are pinned to BullMQ v4.12.2 and checked by CI. Keys, hashes, packed options, and event streams follow that version's Redis data model.
 
-## Features
+### Differences from BullMQ
 
-- **Queue Management**: Create and manage job queues with ease.
-- **Worker Processing**: Define workers to process jobs concurrently.
-- **Event Handling**: Listen to and emit events for job lifecycle management.
-- **Repeatable Jobs**: Schedule jobs to run at regular intervals.
-- **Job Options**: Configure job behavior with flexible options.
+- Cron patterns use [robfig/cron](https://github.com/robfig/cron) instead of `cron-parser`. It accepts 5 or 6 fields, but does not support day-of-week `7` (use `0` for Sunday), `L`, `nthDayOfWeek`, or occurrences more than roughly 5 years out. Day-of-week and day-of-month union semantics may differ at the edges. Repeat dates are normalized to epoch milliseconds when stored.
+- `WorkerOptions.MaxStalledCount` treats 0 as "use the default (1)"; pass a negative value for "fail on first stall" (JS `maxStalledCount: 0`).
+- `WorkerOptions.Backoff` is a default backoff for jobs that set none (the JS equivalent is `defaultJobOptions.backoff` on the queue); `WorkerOptions.BackoffStrategy` handles non-builtin backoff types like JS `settings.backoffStrategy`.
+- Failure stacktraces record the Go error text (Go errors carry no stack); the `stacktrace`/`failedReason` hash fields are written on every failure like upstream.
+- Sandboxed (child-process) processors are not implemented.
+- Lifecycle is context-based: `Worker.Shutdown(ctx)` and `Worker.PauseAndWait(ctx)` bound the graceful drain by the context's deadline, instead of upstream's unbounded blocking `close()`/`pause()`; `Worker.Close()` is the immediate (force) variant.
 
 ## Installation
-
-To install BullMQ for Golang, use the following command:
 
 ```bash
 go get go.codycody31.dev/gobullmq
 ```
 
-## Usage
+## Quick start
 
-### Queue
-
-Create a new queue and add jobs to it. Note: you must provide your own Redis client.
+Queues, workers, and jobs are generic over the payload type. You provide your own Redis client (`redis.Cmdable`); it is never closed by the library. Use a separate client for the queue, each worker, and each `QueueEvents` instance: blocking consumers monopolize a connection and set their own `CLIENT SETNAME`.
 
 ```go
-import (
-  "context"
-  "log"
+package main
 
-  "github.com/redis/go-redis/v9"
-  "go.codycody31.dev/gobullmq"
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"go.codycody31.dev/gobullmq"
 )
 
+// EmailJob is the typed job payload (anything JSON-marshalable works).
+type EmailJob struct {
+	To      string `json:"to"`
+	Subject string `json:"subject"`
+}
+
 func main() {
-  ctx := context.Background()
-  queueClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
-  queue, err := gobullmq.NewQueue("myQueue", queueClient, &gobullmq.QueueOptions{
-    Prefix: "myCustomPrefix",
-  })
-  if err != nil {
-    log.Fatalf("Failed to create queue: %v", err)
-  }
+	queueClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	workerClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+	defer queueClient.Close()
+	defer workerClient.Close()
 
-  // Define job data (can be any struct that can be JSON marshaled)
-  jobData := struct {
-    Message string
-    Count   int
-  }{
-    Message: "Hello BullMQ!",
-    Count:   1,
-  }
+	// Queue[EmailJob]: constructor does no I/O and takes no context.
+	queue, err := gobullmq.NewQueue[EmailJob]("mail", queueClient, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer queue.Close()
 
-  // Add a job using functional options
-  job, err := queue.Add(ctx, "myJob", jobData,
-    gobullmq.AddWithPriority(5),
-    gobullmq.AddWithDelay(2*time.Second), // Delay by 2 seconds
-  )
-  if err != nil {
-    log.Fatalf("Failed to add job: %v", err)
-  }
-  log.Printf("Added job %s with ID: %s\n", job.Name, job.ID)
+	job, err := queue.Add(ctx, "welcome", EmailJob{To: "user@example.com", Subject: "Welcome!"},
+		gobullmq.AddWithAttempts(3),
+		gobullmq.AddWithBackoff(gobullmq.BackoffOptions{Type: "exponential", Delay: 500}),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("added job", job.ID())
+
+	// Worker[EmailJob, string]: processes EmailJob payloads, returns string results.
+	process := func(ctx context.Context, job *gobullmq.Job[EmailJob]) (string, error) {
+		fmt.Printf("sending %q to %s\n", job.Data().Subject, job.Data().To)
+		return "sent", nil
+	}
+	worker, err := gobullmq.NewWorker[EmailJob, string]("mail", workerClient, process, &gobullmq.WorkerOptions{
+		Concurrency: 4,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := worker.Run(ctx); err != nil { // starts processing; returns immediately
+		log.Fatal(err)
+	}
+
+	<-ctx.Done() // wait for SIGINT/SIGTERM
+
+	// Graceful shutdown: stop fetching, drain in-flight jobs, bounded by ctx.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+	if err := worker.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
 }
 ```
 
-### Worker
-
-Define a worker to process jobs from the queue. Note: use a separate Redis client from the queue and events to avoid CLIENT SETNAME collisions.
+Query jobs with typed states and orderings:
 
 ```go
-import (
-  "context"
-  "fmt"
-  "log"
-  "time"
-
-  "github.com/redis/go-redis/v9"
-  "go.codycody31.dev/gobullmq"
-)
-
-func main() {
-  ctx := context.Background()
-  workerClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
-
-  workerProcess := func(ctx context.Context, job *gobullmq.Job) (interface{}, error) {
-    fmt.Printf("Processing job: %s\n", job.Name)
-    _ = job.UpdateProgress(ctx, 25)
-    return "ok", nil
-  }
-
-  worker, err := gobullmq.NewWorker("myQueue", workerClient, workerProcess, &gobullmq.WorkerOptions{
-    Concurrency:     1,
-    StalledInterval: 30 * time.Second,
-    Backoff:         &gobullmq.BackoffOptions{Type: "exponential", Delay: 500},
-  })
-  if err != nil {
-    log.Fatal(err)
-  }
-
-  // Run blocks until ctx is cancelled
-  if err := worker.Run(ctx); err != nil {
-    log.Printf("Worker error: %v", err)
-  }
-}
-```
-
-### Worker in Cluster Mode
-
-```go
-import (
-  "context"
-  "fmt"
-  "log"
-  "os"
-  "os/signal"
-  "syscall"
-  "time"
-
-  "github.com/redis/go-redis/v9"
-  "go.codycody31.dev/gobullmq"
-)
-
-func main() {
-  ctx, cancel := context.WithCancel(context.Background())
-  defer cancel()
-  queueName := "jobQueue"
-
-  // Create Redis Cluster client options
-  rdb := redis.NewClusterClient(&redis.ClusterOptions{
-    Addrs: []string{
-      "127.0.0.1:7000",
-      "127.0.0.1:7001",
-      "127.0.0.1:7002",
-    },
-  })
-
-  _, err := rdb.Ping(ctx).Result()
-  if err != nil {
-    log.Fatalf("Failed to connect to Redis Cluster: %v", err)
-  }
-  fmt.Println("Connected to Redis Cluster")
-
-  // Define the worker process function
-  workerProcess := func(ctx context.Context, job *gobullmq.Job) (interface{}, error) {
-    fmt.Printf("job.Data type: %T, value: %v\n", job.Data, job.Data)
-    return "ok", nil
-  }
-
-  // Initialize the worker with Redis cluster connection
-  worker, err := gobullmq.NewWorker(queueName, rdb, workerProcess, &gobullmq.WorkerOptions{
-    Concurrency:     10,
-    StalledInterval: 30 * time.Second,
-    Prefix:          "{jobQueue}",
-  })
-  if err != nil {
-    log.Fatalf("Failed to create worker: %v", err)
-  }
-
-  // Set up typed error callback
-  worker.OnError(func(err error) {
-    fmt.Printf("Worker error: %v\n", err)
-  })
-
-  fmt.Println("Starting gobullmq worker with concurrency 10...")
-  fmt.Println("Waiting for 'job' tasks in queue 'jobQueue'...")
-
-  // Handle graceful shutdown
-  c := make(chan os.Signal, 1)
-  signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-  // Run the worker in a goroutine; cancel ctx to stop it
-  go func() {
-    if err := worker.Run(ctx); err != nil {
-      log.Printf("Worker error: %v", err)
-    }
-  }()
-
-  // Wait for interrupt signal
-  <-c
-
-  fmt.Println("\nShutting down worker...")
-  cancel()
-  rdb.Close()
-  fmt.Println("Worker shut down gracefully")
-}
-```
-
-### QueueEvents
-
-Listen to events emitted by the queue. Use a separate Redis client:
-
-```go
-eventsClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379", DB: 0})
-events, err := gobullmq.NewQueueEvents("myQueue", eventsClient, &gobullmq.QueueEventsOptions{
-    Autorun: true,
-})
+counts, err := queue.JobCounts(ctx, gobullmq.JobStateWaiting, gobullmq.JobStateActive, gobullmq.JobStateFailed)
 if err != nil {
-    log.Fatal(err)
+	log.Fatal(err)
+}
+fmt.Println("waiting:", counts[gobullmq.JobStateWaiting])
+
+failed, err := queue.Jobs(ctx, []gobullmq.JobState{gobullmq.JobStateFailed}, 0, 9, gobullmq.SortDesc)
+if err != nil {
+	log.Fatal(err)
+}
+for _, j := range failed {
+	// Retry back onto the wait list, at the front (LIFO) or back (FIFO).
+	if err := j.Retry(ctx, gobullmq.JobStateFailed, gobullmq.FIFO); err != nil {
+		log.Printf("retry %s: %v", j.ID(), err)
+	}
 }
 
-events.On("added", func(args ...interface{}) {
-    fmt.Println("Job added:", args)
-})
+state, err := queue.JobState(ctx, job.ID())
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(state == gobullmq.JobStateCompleted)
+```
 
-events.On("error", func(args ...interface{}) {
-    fmt.Println("Error event:", args)
+## Events
+
+Workers emit in-process events with typed callbacks:
+
+```go
+worker.OnCompleted(func(job *gobullmq.Job[EmailJob], result string) {
+	fmt.Println("completed:", job.ID(), result)
+})
+worker.OnFailed(func(job *gobullmq.Job[EmailJob], err error) {
+	fmt.Println("failed:", job.ID(), err)
+})
+worker.OnActive(func(job *gobullmq.Job[EmailJob]) {
+	fmt.Println("active:", job.ID())
+})
+worker.OnError(func(err error) {
+	fmt.Println("worker error:", err)
 })
 ```
 
-## Configuration
-
-Configuration is done using option structs passed to `NewQueue`, `NewWorker`, and `NewQueueEvents`. You must construct and pass your own `redis.Cmdable` (e.g., `*redis.Client` or `*redis.ClusterClient`).
-
-### Queue Options
-
-- `Prefix`: Sets a custom prefix for Redis keys (default is "bull").
-- `StreamEventsMaxLen`: Sets the maximum length for the events stream (default 10000).
-
-### Worker Options
-
-- `Concurrency`: The number of concurrent jobs the worker can process.
-- `StalledInterval`: The interval (`time.Duration`) for checking stalled jobs.
-- `Backoff`: Configure retry backoff behavior (e.g., `{Type: "fixed"|"exponential", Delay: ms}`).
-
-### Important note on Redis clients
-
-- Use three separate Redis clients in your app: one each for `Queue`, `Worker`, and `QueueEvents`. This avoids `CLIENT SETNAME` overwrites, as each component sets a distinct client name.
-
-### QueueEvents Options
-
-- `Autorun`: Whether to automatically start listening for events.
-- `Prefix`: Sets a custom prefix for Redis keys.
-
-## Examples
-
-### Adding a Job with Options
+`QueueEvents` reads the queue's Redis event stream, including events from Node.js producers and workers. Give it a dedicated Redis client. When `Autorun` is set, the constructor context controls the consumer; otherwise call `Run(ctx)` yourself.
 
 ```go
-jobData := map[string]string{"task": "send_email", "to": "user@example.com"}
-
-job, err := queue.Add(ctx, "emailJob", jobData,
-    gobullmq.AddWithPriority(2),
-    gobullmq.AddWithDelay(5*time.Second), // Delay 5 seconds
-    gobullmq.AddWithAttempts(3),
-    gobullmq.AddWithRemoveOnComplete(gobullmq.KeepJobs{Count: 100}), // Keep last 100 completed
-)
+eventsClient := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+defer eventsClient.Close()
+events, err := gobullmq.NewQueueEvents(ctx, "mail", eventsClient, &gobullmq.QueueEventsOptions{
+	Autorun: true,
+})
 if err != nil {
-    log.Fatalf("Failed to add email job: %v", err)
+	log.Fatal(err)
+}
+defer events.Close()
+
+events.OnCompleted(func(evt gobullmq.CompletedEvent) {
+	fmt.Println("completed:", evt.JobID, evt.ReturnValue)
+})
+events.OnFailed(func(evt gobullmq.FailedEvent) {
+	fmt.Println("failed:", evt.JobID, evt.FailedReason)
+})
+events.OnProgress(func(evt gobullmq.ProgressEvent) {
+	fmt.Println("progress:", evt.JobID, evt.Data)
+})
+```
+
+A producer can block until a job finishes (bound the wait with the context):
+
+```go
+waitCtx, cancel := context.WithTimeout(ctx, time.Minute)
+defer cancel()
+result, err := job.WaitUntilFinished(waitCtx, events)
+```
+
+## Flows
+
+A `FlowProducer` adds a parent job together with its children atomically; the parent stays in the `waiting-children` state until every child has completed. The producer holds no resources of its own, so there is nothing to close.
+
+```go
+flows, err := gobullmq.NewFlowProducer(client, nil)
+if err != nil {
+	log.Fatal(err)
+}
+
+tree, err := flows.Add(ctx, gobullmq.FlowJob{
+	Name:      "assemble",
+	QueueName: "assembly",
+	Children: []gobullmq.FlowJob{
+		{Name: "weld", QueueName: "parts", Data: map[string]any{"part": "frame"}},
+		{Name: "paint", QueueName: "parts", Data: map[string]any{"part": "chassis"}},
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println("parent:", tree.Job.ID(), "children:", len(tree.Children))
+
+// Fetch the tree back later:
+fetched, err := flows.Flow(ctx, gobullmq.FlowGetOptions{
+	ID:        tree.Job.ID(),
+	QueueName: "assembly",
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println("fetched parent:", fetched.Job.ID())
+```
+
+Inside a parent's processor, `job.ChildrenValues(ctx)` returns the children's results.
+
+## Repeatable jobs
+
+Pass repeat options when adding; each due iteration is materialized as a delayed job. `Every` is in milliseconds, or use a cron `Pattern`:
+
+```go
+_, err = queue.Add(ctx, "report", EmailJob{To: "ops@example.com", Subject: "Hourly report"},
+	gobullmq.AddWithRepeat(gobullmq.JobRepeatOptions{
+		Pattern: "0 * * * *", // hourly; or Every: 10000 for every 10s
+	}),
+)
+```
+
+List and remove repeatables:
+
+```go
+repeatables, err := queue.RepeatableJobs(ctx, 0, -1, gobullmq.SortAsc)
+if err != nil {
+	log.Fatal(err)
+}
+for _, r := range repeatables {
+	if err := queue.RemoveRepeatableByKey(ctx, r.Key); err != nil {
+		log.Printf("remove %s: %v", r.Key, err)
+	}
 }
 ```
 
-### Adding a Repeatable Job
+## Manual processing
+
+A worker can be used without `Run()`: fetch jobs explicitly and settle them yourself. The token identifies the lock owner; the fetched job carries it (`job.Token()`).
 
 ```go
-// Add a job that repeats every 10 seconds
-_, err = queue.Add(ctx, "myRepeatableJob", jobData,
-    gobullmq.AddWithRepeat(gobullmq.JobRepeatOptions{
-        Every: 10000, // Repeat every 10000 ms (10 seconds)
-    }),
-)
+worker, err := gobullmq.NewWorker[EmailJob, string]("mail", workerClient, nil, nil)
 if err != nil {
-    log.Fatal(err)
+	log.Fatal(err)
 }
+
+job, err := worker.NextJob(ctx, "manual-consumer-1")
+if err != nil {
+	log.Fatal(err)
+}
+if job != nil {
+	if err := send(job.Data()); err != nil {
+		if ferr := job.MoveToFailed(ctx, err, false); ferr != nil {
+			log.Printf("moveToFailed %s: %v", job.ID(), ferr)
+		}
+	} else {
+		// Pass true to get the next waiting job back, already locked with
+		// the same token (nil when none).
+		next, err := job.MoveToCompleted(ctx, "sent", true)
+		if err != nil {
+			log.Printf("moveToCompleted %s: %v", job.ID(), err)
+		}
+		_ = next
+	}
+}
+```
+
+## Lifecycle
+
+```go
+// Worker, graceful: stop fetching, drain in-flight jobs, bounded by ctx.
+// When ctx expires first, remaining jobs are abandoned and the error wraps
+// gobullmq.ErrShutdownTimeout.
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+err = worker.Shutdown(shutdownCtx)
+
+// Worker, immediate: in-flight jobs are abandoned (their process contexts
+// are cancelled); the stalled checker of another worker will recover them.
+err = worker.Close()
+
+// Worker pause/resume without closing.
+worker.Pause()                      // immediate; in-flight jobs keep running
+err = worker.PauseAndWait(pauseCtx) // pause, then wait for in-flight jobs
+worker.Resume()
+
+// Queue pausing affects all workers on the queue (state lives in Redis).
+err = queue.Pause(ctx)
+err = queue.Resume(ctx)
+
+// Queue and QueueEvents close locally, without a context; the Redis clients
+// are yours to close.
+err = queue.Close()
+err = events.Close()
 ```
 
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request on GitHub.
+Open an issue or submit a pull request on GitHub.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+MIT. See [LICENSE](LICENSE).

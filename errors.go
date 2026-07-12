@@ -7,12 +7,17 @@ var (
 	ErrRateLimit       = errors.New("bullmq: rate limit exceeded")
 	ErrDelayed         = errors.New("bullmq: delayed")
 	ErrWaitingChildren = errors.New("bullmq: waiting children")
+	// ErrUnrecoverable marks a processing error as non-retryable: the job
+	// moves straight to failed, skipping remaining attempts. Wrap it with
+	// errors.Join or fmt.Errorf("...%w...", ErrUnrecoverable) to add context.
+	// Mirrors upstream UnrecoverableError.
+	ErrUnrecoverable = errors.New("bullmq: unrecoverable error")
 )
 
 // Sentinel errors for job operations.
 var (
 	ErrJobNotFound   = errors.New("bullmq: job not found")
-	ErrJobNoContext  = errors.New("bullmq: job has no queue context; retrieve via Queue.GetJob() or worker processing")
+	ErrJobNoContext  = errors.New("bullmq: job has no queue context; retrieve via Queue.Job() or worker processing")
 	ErrJobLocked     = errors.New("bullmq: job is locked")
 	ErrJobNotInState = errors.New("bullmq: job not in expected state")
 	ErrMissingLock   = errors.New("bullmq: missing lock for job")

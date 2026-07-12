@@ -13,24 +13,19 @@ func AddWithPriority(priority int) AddOption {
 }
 
 // AddWithRemoveOnComplete configures job removal upon successful completion.
-func AddWithRemoveOnComplete(keep ...KeepJobs) AddOption {
+// KeepJobs{Count: 0} removes the job immediately.
+func AddWithRemoveOnComplete(keep KeepJobs) AddOption {
 	return func(o *JobOptions) {
-		setting := KeepJobs{Count: 0}
-		if len(keep) > 0 {
-			setting = keep[0]
-		}
+		setting := keep
 		o.RemoveOnComplete = &setting
 	}
 }
 
 // AddWithRemoveOnFail configures job removal upon failure.
-// When called with no arguments, all failed jobs are removed (Count: 0).
-func AddWithRemoveOnFail(keep ...KeepJobs) AddOption {
+// KeepJobs{Count: 0} removes the job immediately.
+func AddWithRemoveOnFail(keep KeepJobs) AddOption {
 	return func(o *JobOptions) {
-		setting := KeepJobs{Count: 0}
-		if len(keep) > 0 {
-			setting = keep[0]
-		}
+		setting := keep
 		o.RemoveOnFail = &setting
 	}
 }
@@ -38,7 +33,7 @@ func AddWithRemoveOnFail(keep ...KeepJobs) AddOption {
 // AddWithAttempts sets the maximum number of attempts for the job.
 func AddWithAttempts(times int) AddOption {
 	return func(o *JobOptions) {
-		if times > 0 {
+		if times >= 0 {
 			o.Attempts = times
 		}
 	}
@@ -47,7 +42,7 @@ func AddWithAttempts(times int) AddOption {
 // AddWithDelay sets an initial delay before the job can be processed.
 func AddWithDelay(delay time.Duration) AddOption {
 	return func(o *JobOptions) {
-		if delay > 0 {
+		if delay >= 0 {
 			o.Delay = int(delay.Milliseconds())
 		}
 	}
@@ -89,7 +84,7 @@ func AddWithFailParentOnFailure(fail bool) AddOption {
 }
 
 // AddWithParent sets the parent job information for this job.
-func AddWithParent(parentOpts ParentOpts) AddOption {
+func AddWithParent(parentOpts ParentOptions) AddOption {
 	return func(o *JobOptions) {
 		o.Parent = &parentOpts
 	}
@@ -106,5 +101,26 @@ func AddWithRemoveDependencyOnFailure(remove bool) AddOption {
 func AddWithBackoff(opts BackoffOptions) AddOption {
 	return func(o *JobOptions) {
 		o.Backoff = &opts
+	}
+}
+
+// AddWithKeepLogs caps the number of log entries kept for the job.
+func AddWithKeepLogs(n int) AddOption {
+	return func(o *JobOptions) {
+		o.KeepLogs = n
+	}
+}
+
+// AddWithStackTraceLimit caps the stacktrace entries kept on job failures.
+func AddWithStackTraceLimit(n int) AddOption {
+	return func(o *JobOptions) {
+		o.StackTraceLimit = n
+	}
+}
+
+// AddWithSizeLimit rejects the job at add time if its JSON data exceeds n bytes.
+func AddWithSizeLimit(n int) AddOption {
+	return func(o *JobOptions) {
+		o.SizeLimit = n
 	}
 }
