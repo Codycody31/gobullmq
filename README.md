@@ -4,7 +4,11 @@ BullMQ for Golang is a Redis-backed job queue compatible with [BullMQ](https://g
 
 ## BullMQ compatibility
 
-The embedded Lua scripts are pinned to BullMQ v4.12.2 and checked by CI. Keys, hashes, packed options, and event streams follow that version's Redis data model.
+The embedded Lua scripts are pinned to BullMQ v4.12.2 at commit
+[`a01bb0b`](https://github.com/taskforcesh/bullmq/commit/a01bb0b0345509cde6c74843323de6b67729f310)
+and checked by CI. Keys, hashes, packed options, and event streams follow that
+exact version's Redis data model. See [COMPATIBILITY.md](COMPATIBILITY.md) for
+the Go release line, Redis test matrix, and support status.
 
 ### Differences from BullMQ
 
@@ -17,8 +21,20 @@ The embedded Lua scripts are pinned to BullMQ v4.12.2 and checked by CI. Keys, h
 
 ## Installation
 
+The first release for the current module path is a release candidate. After
+`v1.1.0` is published, choose an exact release or track fixes on its BullMQ
+line:
+
 ```bash
-go get go.codycody31.dev/gobullmq
+go get go.codycody31.dev/gobullmq@v1.1.0  # exact release
+go get go.codycody31.dev/gobullmq@v1.1    # latest fix on BullMQ v4.12.2
+```
+
+Until then, testers can fetch `main` without consulting the stale proxy entry
+created by historical tags from a different module path:
+
+```bash
+GOPROXY=direct go get go.codycody31.dev/gobullmq@main
 ```
 
 ## Quick start

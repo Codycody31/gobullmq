@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - release/v*-bullmq-v*
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release:
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: 1.26.5
+
+      - name: Validate release branch and candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          go run ./scripts/check_compat.go -branch "$GITHUB_REF_NAME"
+
+          candidate="$(jq -r '.["."] // empty' .release-please-manifest.json)"
+          if [[ -z "$candidate" ]]; then
+            echo "No merged release candidate is present yet"
+            exit 0
+          fi
+
+          release_line="$(jq -r .releaseLine compatibility/bullmq.json)"
+          candidate_line="v${candidate%.*}"
+          if [[ "$candidate_line" != "$release_line" ]]; then
+            echo "::error::candidate $candidate is outside branch release line $release_line"
+            exit 1
+          fi
+
+          tag="v$candidate"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              echo "::error::$tag exists without its GitHub Release; preserve it and investigate"
+              exit 1
+            fi
+            echo "$tag is already published; Release Please may prepare the next patch"
+            exit 0
+          fi
+
+          if ! grep -Eq "^## \\[?${candidate}\\]?(\\(|[[:space:]]|$)" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no $candidate section"
+            exit 1
+          fi
+
+      - name: Run Release Please
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ github.token }}
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Add compatibility details and remove release PR attribution
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          number="$(jq -r '.number // empty' <<<"$PR")"
+          if [[ -z "$number" ]]; then
+            echo "::error::Release Please reported a PR without its number"
+            exit 1
+          fi
+          title="$(gh pr view "$number" --json title --jq .title)"
+          candidate="$(grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' <<<"$title" | tail -n 1)"
+          if [[ -z "$candidate" ]]; then
+            echo "::error::release PR title has no candidate version: $title"
+            exit 1
+          fi
+
+          bullmq_version="$(jq -r .bullmq.version compatibility/bullmq.json)"
+          bullmq_commit="$(jq -r .bullmq.commit compatibility/bullmq.json)"
+          go_minimum="$(jq -r .go.minimum compatibility/bullmq.json)"
+          redis_version="$(jq -r .redis.version compatibility/bullmq.json)"
+          gh pr view "$number" --json body --jq .body > /tmp/release-pr-body-current.md
+          awk 'seen || $0 == "---" { seen = 1; print }' /tmp/release-pr-body-current.md > /tmp/release-pr-notes.md
+          sed -i '/github\.com\/googleapis\/release-please/d' /tmp/release-pr-notes.md
+          {
+            echo "Release candidate for the fixed BullMQ compatibility line."
+            echo
+            echo "- Go release: v${candidate}"
+            echo "- BullMQ: exact v${bullmq_version} at ${bullmq_commit}"
+            echo "- Minimum Go: ${go_minimum}"
+            echo "- Tested Redis: ${redis_version}, standalone and six-node Cluster"
+            echo "- Install: \`go get go.codycody31.dev/gobullmq@v${candidate}\`"
+            echo "- Release branch: \`${GITHUB_REF_NAME}\`"
+            echo
+            cat /tmp/release-pr-notes.md
+          } > /tmp/release-pr-body.md
+          gh pr edit "$number" --body-file /tmp/release-pr-body.md
+
+      - name: Add compatibility details to GitHub Release
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          bullmq_version="$(jq -r .bullmq.version compatibility/bullmq.json)"
+          bullmq_commit="$(jq -r .bullmq.commit compatibility/bullmq.json)"
+          go_minimum="$(jq -r .go.minimum compatibility/bullmq.json)"
+          redis_version="$(jq -r .redis.version compatibility/bullmq.json)"
+          gh release view "$TAG" --json body --jq .body > /tmp/release-notes-current.md
+          {
+            echo "BullMQ compatibility: exact v${bullmq_version} at ${bullmq_commit}"
+            echo
+            echo "Install: \`go get go.codycody31.dev/gobullmq@${TAG}\`"
+            echo
+            echo "Minimum Go: ${go_minimum}"
+            echo
+            echo "Tested Redis: ${redis_version}, standalone and six-node Cluster"
+            echo
+            echo "Release branch: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_REF_NAME}"
+            echo
+            cat /tmp/release-notes-current.md
+          } > /tmp/release-notes.md
+          gh release edit "$TAG" \
+            --title "gobullmq ${TAG} (BullMQ v${bullmq_version})" \
+            --notes-file /tmp/release-notes.md
+
+      - name: Smoke test direct and proxy consumers
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          MODULE: go.codycody31.dev/gobullmq
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          smoke_consumer() {
+            local directory="$1"
+            local proxy="$2"
+            mkdir -p "$directory"
+            cd "$directory"
+            go mod init consumer.example
+            GOPROXY="$proxy" go get "$MODULE@$TAG"
+            cat > main.go <<'EOF'
+          package main
+
+          import (
+            "github.com/redis/go-redis/v9"
+            gobullmq "go.codycody31.dev/gobullmq"
+          )
+
+          func main() {
+            client := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+            _, _ = gobullmq.NewQueue[map[string]any]("release-smoke", client, nil)
+          }
+          EOF
+            GOPROXY="$proxy" go build ./...
+          }
+
+          export GOPATH=/tmp/gobullmq-direct-gopath
+          export GOMODCACHE=/tmp/gobullmq-direct-modcache
+          smoke_consumer /tmp/gobullmq-direct-consumer direct
+
+          export GOPATH=/tmp/gobullmq-proxy-gopath
+          export GOMODCACHE=/tmp/gobullmq-proxy-modcache
+          deadline=$((SECONDS + 600))
+          until GOPROXY=https://proxy.golang.org go mod download "$MODULE@$TAG"; do
+            if (( SECONDS >= deadline )); then
+              echo "::error::proxy.golang.org did not index $MODULE@$TAG within ten minutes"
+              exit 1
+            fi
+            sleep 15
+          done
+          smoke_consumer /tmp/gobullmq-proxy-consumer https://proxy.golang.org
