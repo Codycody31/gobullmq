@@ -225,6 +225,7 @@ jobs:
         run: scripts/ci/redis-"$REDIS_MODE".sh down
 
   required:
+    name: CI / required
     if: always()
     needs:
       - pr-title
