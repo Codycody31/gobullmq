@@ -5,7 +5,7 @@
   "description": "BullMQ interoperability fixture for gobullmq",
   "type": "commonjs",
   "dependencies": {
-    "bullmq": "4.12.2",
+    "bullmq": "6.2.0",
     "ioredis": "5.3.2"
   }
 }
