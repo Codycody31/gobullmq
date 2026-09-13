@@ -607,10 +607,6 @@ func (w *Worker[D, R]) moveToActive(ctx context.Context, token string, jobId str
 		return nil, nil
 	}
 
-	if result.ID == "0" || result.ID == "" {
-		return nil, nil
-	}
-
 	return w.nextJobFromJobData(ctx, result.JobData, result.ID, result.LimitUntil, result.DelayUntil, token)
 }
 
@@ -634,8 +630,9 @@ func raw2NextJobData(raw []any) *nextJobData {
 	}
 
 	if raw[0] != nil {
-		jobMap := utils.Array2obj(raw[0])
-		result.JobData = jobMap
+		if jobData, ok := raw[0].([]any); ok {
+			result.JobData = utils.Array2obj(jobData)
+		}
 	}
 
 	return result
