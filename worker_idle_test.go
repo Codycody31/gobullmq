@@ -28,6 +28,16 @@ type cmdCounter struct {
 	blmove   atomic.Int64
 	clientID atomic.Int64
 	unblock  atomic.Int64
+	// readKeys is the set of wait-list keys a blocking read has gone out for.
+	// It tells the workers apart when several share the client.
+	readKeys sync.Map
+}
+
+// readSent reports whether a blocking read has gone out for the wait list at
+// key.
+func (h *cmdCounter) readSent(key string) bool {
+	_, ok := h.readKeys.Load(key)
+	return ok
 }
 
 // subcommand returns the lowercased second word of cmd ("unblock" for
@@ -53,6 +63,9 @@ func (h *cmdCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
 			h.evalsha.Add(1)
 		case "blmove":
 			h.blmove.Add(1)
+			if args := cmd.Args(); len(args) > 1 {
+				h.readKeys.Store(args[1], struct{}{})
+			}
 		case "client":
 			switch subcommand(cmd) {
 			case "id":
@@ -903,16 +916,6 @@ func TestBusyPoolKeepsWorkersOffPinnedReads(t *testing.T) {
 	var names []string
 	var all []*Worker[idleData, string]
 	var logs []*errorLog
-	for i := 0; i < workers; i++ {
-		name := testQueueName(t, base)
-		w, errs := runIdleWorker(t, name, shared, func(ctx context.Context, job *Job[idleData]) (string, error) {
-			ran <- job.Name()
-			return "ok", nil
-		}, nil)
-		// Give each one time to pin before the next looks at the pool.
-		time.Sleep(100 * time.Millisecond)
-		names, all, logs = append(names, name), append(all, w), append(logs, errs)
-	}
 	defer func() {
 		var closing sync.WaitGroup
 		for _, w := range all {
@@ -924,6 +927,26 @@ func TestBusyPoolKeepsWorkersOffPinnedReads(t *testing.T) {
 		}
 		closing.Wait()
 	}()
+	for i := 0; i < workers; i++ {
+		name := testQueueName(t, base)
+		// A worker decides how to wait from how much of the pool is in use
+		// at that moment. The stalled check it runs when it starts would add
+		// a connection to that count, and an earlier worker's read timing
+		// out would take one away, so the check is skipped and the wait is
+		// set to its maximum.
+		opts := &WorkerOptions{SkipStalledCheck: true, DrainDelay: maxBlockTimeout}
+		w, errs := runIdleWorker(t, name, shared, func(ctx context.Context, job *Job[idleData]) (string, error) {
+			ran <- job.Name()
+			return "ok", nil
+		}, opts)
+		names, all, logs = append(names, name), append(all, w), append(logs, errs)
+		// Once its read has gone out, the worker has chosen how to wait, and
+		// a pinned read is holding the connection the next worker has to
+		// count.
+		waitUntil(t, 5*time.Second, "the worker to send its blocking read", func() bool {
+			return counter.readSent(w.keyPrefix + "wait")
+		})
+	}
 
 	// Half of a pool of four is two.
 	for i, w := range all {
