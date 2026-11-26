@@ -18,6 +18,7 @@ the Go release line, Redis test matrix, and support status.
 - Failure stacktraces record the Go error text (Go errors carry no stack); the `stacktrace`/`failedReason` hash fields are written on every failure like upstream.
 - Sandboxed (child-process) processors are not implemented.
 - Lifecycle is context-based: `Worker.Shutdown(ctx)` and `Worker.PauseAndWait(ctx)` bound the graceful drain by the context's deadline, instead of upstream's unbounded blocking `close()`/`pause()`; `Worker.Close()` is the immediate (force) variant.
+- An idle worker waits for jobs in a blocking `BLMOVE` on a connection from the pool of the client you give it, where upstream opens a dedicated blocking connection. Upstream drops that connection to pause or close; the worker here ends the read with `CLIENT UNBLOCK` sent on a second connection, so it always sees what the read returned and can put back a job that arrived in the same instant. This works on a `*redis.Client` or `*redis.ClusterClient` with less than half of its pool in use. Otherwise the worker falls back to one-second reads that it cannot interrupt, which [Lifecycle](#lifecycle) describes.
 
 ## Installation
 
@@ -314,6 +315,17 @@ err = queue.Resume(ctx)
 err = queue.Close()
 err = events.Close()
 ```
+
+`Pause`, `Close` and `Shutdown` end an idle worker's blocking read right away. If a job arrives in that same instant, the worker puts it back in the queue instead of processing it.
+
+A worker cannot end the read in flight when its client is some other `redis.Cmdable` (a `Ring`, a single `Conn`, a wrapper), when the pool has one connection or is at least half in use, or when the server has no `CLIENT UNBLOCK`. It then waits in one-second reads, and four things change for as long as that lasts:
+
+- `Close` and `Shutdown` take up to a second on an idle worker, and a `Shutdown` context shorter than that can time out with nothing in progress.
+- `Pause` still returns right away, but `PauseAndWait` returns once the read has ended. A job that arrives before then is put back.
+- `WorkerOptions.DrainDelay` is rounded up to whole seconds.
+- In the last second before a delayed job is due the worker checks the queue every 100 ms.
+
+Giving each worker its own client, as recommended above, is enough to keep the pool free.
 
 ## Contributing
 

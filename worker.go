@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,12 +65,17 @@ type Worker[D any, R any] struct {
 	drained    atomic.Bool
 
 	// blockingFetch serializes the blocking wait-list read so at most one
-	// BLMOVE blocks at a time (upstream's this.waiting guard).
+	// BLMOVE blocks at a time (upstream's this.waiting guard). It is held
+	// until the read's result has been moved to active or handed back, so a
+	// free guard means this worker has no blocking read outstanding.
 	blockingFetch sync.Mutex
 	// waitCancel aborts an in-flight blocking read (upstream force-disconnects
 	// the blocking connection on pause/close).
 	waitCancelMu sync.Mutex
 	waitCancel   context.CancelFunc
+	// pinnedRead records whether waitPinned can be used. The first idle wait
+	// settles it.
+	pinnedRead atomic.Int32
 
 	scripts *scripts
 
@@ -79,6 +85,11 @@ type Worker[D any, R any] struct {
 }
 
 // WorkerOptions configures a Worker.
+//
+// DrainDelay is how long an idle worker blocks waiting for a job before it
+// checks the queue again. It defaults to 5s and is capped at 10s. A worker
+// that has to wait in one-second reads (see Lifecycle in the README) rounds
+// it up to whole seconds.
 type WorkerOptions struct {
 	Autorun          bool
 	Concurrency      int
@@ -246,7 +257,29 @@ const (
 	defaultStalledInterval = 30 * time.Second
 	defaultRunRetryDelay   = 15 * time.Second // upstream runRetryDelay: 15000
 	defaultDrainDelay      = 5 * time.Second  // upstream drainDelay: 5
-	minQueueCleanupTimeout = time.Second
+
+	maxBlockTimeout = 10 * time.Second      // upstream maximumBlockTimeout
+	minBlockTimeout = 10 * time.Millisecond // upstream's floor of 0.01s
+
+	// waitSliced reads in slices of blockingReadSlice and, once a delayed
+	// job is less than one slice away, checks every delayedPollInterval.
+	blockingReadSlice   = time.Second
+	delayedPollInterval = 100 * time.Millisecond
+	// unblockRetryMax caps the pause between CLIENT UNBLOCK attempts.
+	unblockRetryMax = 50 * time.Millisecond
+	// returnToWait cannot use the run context, which may already be
+	// cancelled, so it gets a deadline of its own.
+	returnToWaitTimeout = 2 * time.Second
+	// minQueueCleanupTimeout gives a read that could not be interrupted time
+	// to end and hand back what it pulled.
+	minQueueCleanupTimeout = blockingReadSlice + 500*time.Millisecond
+)
+
+// States of Worker.pinnedRead.
+const (
+	pinnedReadUntried int32 = iota
+	pinnedReadOn
+	pinnedReadOff
 )
 
 // NewWorker creates a new Worker instance.
@@ -510,56 +543,87 @@ func (w *Worker[D, R]) getNextJob(ctx context.Context, token string, opts nextJo
 		return nil, nil
 	}
 
-	if limitUntil := w.limitUntil.Load(); limitUntil > time.Now().UnixMilli() {
-		if err := w.delay(ctx, limitUntil); err != nil {
-			return nil, fmt.Errorf("failed to delay: %w", err)
-		}
-	}
-
-	if w.drained.Load() && opts.Block {
-		// One blocking read at a time (upstream this.waiting).
-		w.blockingFetch.Lock()
-		var jobID string
-		// Re-check under the guard: Pause/Close may have landed while this
-		// task waited for the previous blocking read to finish; starting a
-		// fresh BLMOVE then would keep pulling jobs during a pause or a
-		// Shutdown drain window.
-		if !w.paused.Load() && !w.closing.Load() {
-			var err error
-			jobID, err = w.waitForJob(ctx)
-			if err != nil {
-				w.blockingFetch.Unlock()
-				if !w.paused.Load() && !w.closing.Load() {
-					return nil, fmt.Errorf("failed to wait for job: %w", err)
-				}
+	// A rate limit is waited out here and then answered by moveToActive,
+	// never by the blocking read (upstream blocks only when !this.limitUntil):
+	// the jobs it held back may be prioritized or delayed, and those never
+	// show up in the wait list a blocking read watches.
+	limited := false
+	if limitUntil := w.limitUntil.Load(); limitUntil > 0 {
+		limited = true
+		if limitUntil > time.Now().UnixMilli() {
+			if err := w.delay(ctx, limitUntil); err != nil {
+				// Only a cancelled run context ends the delay early.
+				return nil, nil
+			}
+			if w.paused.Load() || w.closing.Load() {
 				return nil, nil
 			}
 		}
-		w.blockingFetch.Unlock()
-		if jobID == "" && (w.paused.Load() || w.closing.Load()) {
-			// Nothing was moved and we are pausing/closing: do not promote
-			// or lock new work. (A non-empty jobID was already moved by the
-			// BLMOVE server-side; locking it lets stalled recovery handle
-			// the boundary, same as upstream's disconnect race.)
-			return nil, nil
-		}
-		// A block timeout still proceeds to moveToActive: its Lua promotes
-		// due delayed jobs, the only mechanism by which an idle worker
-		// picks up delayed work.
-		return w.moveToActive(ctx, token, jobID)
+	}
+
+	if opts.Block && !limited && w.drained.Load() {
+		return w.fetchBlocking(ctx, token)
 	}
 
 	return w.moveToActive(ctx, token, "")
 }
 
-// moveToActive moves the job to the active list.
-func (w *Worker[D, R]) moveToActive(ctx context.Context, token string, jobId string) (*rawJob, error) {
-	if jobId != "" && len(jobId) > 2 && jobId[0:2] == "0:" {
-		blockUntil, err := strconv.Atoi(jobId[2:])
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse blockUntil: %w", err)
+// fetchBlocking parks an idle worker in the blocking wait-list read, then
+// moves whatever the read yields to active.
+func (w *Worker[D, R]) fetchBlocking(ctx context.Context, token string) (*rawJob, error) {
+	// One blocking read at a time (upstream this.waiting). The guard covers
+	// moveToActive too, so the next fetcher sees a drained flag that already
+	// reflects this fetch.
+	w.blockingFetch.Lock()
+	defer w.blockingFetch.Unlock()
+
+	// Pause/Close may have landed while this task queued behind another
+	// fetcher, and a read started now would keep pulling jobs through a
+	// pause or a Shutdown drain.
+	if w.paused.Load() || w.closing.Load() {
+		return nil, nil
+	}
+	// The fetcher ahead may have found work, and one "0:0" marker announces
+	// any number of prioritized jobs, so more can be ready with nothing in
+	// the wait list to wake a read.
+	if !w.drained.Load() {
+		return w.moveToActive(ctx, token, "")
+	}
+
+	jobID, err := w.waitForJob(ctx)
+	if err != nil {
+		if w.paused.Load() || w.closing.Load() {
+			return nil, nil
 		}
-		w.blockUntil.Store(int64(blockUntil))
+		return nil, fmt.Errorf("failed to wait for job: %w", err)
+	}
+	if jobID == "" && (w.paused.Load() || w.closing.Load()) {
+		// Nothing was moved and we are pausing/closing: do not promote or
+		// lock new work.
+		return nil, nil
+	}
+	// A block timeout still proceeds to moveToActive: its Lua promotes due
+	// delayed jobs, the only mechanism by which an idle worker picks up
+	// delayed work.
+	return w.moveToActive(ctx, token, jobID)
+}
+
+// moveToActive moves the job to the active list. jobId is the ID the blocking
+// read already moved there, or "" to let the script pick the next job.
+func (w *Worker[D, R]) moveToActive(ctx context.Context, token string, jobId string) (*rawJob, error) {
+	// A delay marker says when the next delayed job is due.
+	if strings.HasPrefix(jobId, "0:") {
+		w.blockUntil.Store(markerTimestamp(jobId))
+	}
+	// An ID from the blocking read sits in active without a lock until the
+	// script has run. If the worker is stopping, give it back. Any other
+	// failure is left to stalled-job recovery as upstream does, which also
+	// retires an ID that can never be locked.
+	fail := func(err error) (*rawJob, error) {
+		if jobId != "" && (ctx.Err() != nil || w.closing.Load()) {
+			w.returnToWait(jobId)
+		}
+		return nil, err
 	}
 
 	keys := []string{
@@ -588,12 +652,12 @@ func (w *Worker[D, R]) moveToActive(ctx context.Context, token string, jobId str
 
 	msgPackedOpts, err := msgpack.Marshal(opts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal opts: %w", err)
+		return fail(fmt.Errorf("failed to marshal opts: %w", err))
 	}
 
 	rawResult, err := lua.MoveToActive(ctx, w.redisClient, keys, w.keyPrefix, time.Now().UnixMilli(), jobId, string(msgPackedOpts))
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
 
 	rawResultSlice, ok := rawResult.([]any)
@@ -638,26 +702,148 @@ func raw2NextJobData(raw []any) *nextJobData {
 	return result
 }
 
+// markerTimestamp reads the due time out of a "0:<timestamp>" delay marker.
+// The timestamp is a Lua number and usually carries a fraction
+// ("0:1795703941889.1"); like upstream's parseInt(...) || 0, anything
+// unreadable counts as 0 (no known delay, which "0:0" also means).
+func markerTimestamp(marker string) int64 {
+	ts, err := strconv.ParseFloat(strings.TrimPrefix(marker, "0:"), 64)
+	if err != nil || math.IsNaN(ts) || ts <= 0 || ts >= math.MaxInt64 {
+		return 0
+	}
+	return int64(ts)
+}
+
 // waitForJob waits for a job ID from the wait list using the
 // BRPOPLPUSH-equivalent orientation (pop the oldest job from the right of
 // wait, push to the left of active). A block timeout returns "" without
 // error; Pause/Close abort the wait.
+//
+// go-redis can neither interrupt a blocking read in flight nor send BLMOVE a
+// timeout shorter than a second. waitPinned gets around both and is used
+// whenever the client allows it; waitSliced is the fallback.
 func (w *Worker[D, R]) waitForJob(ctx context.Context) (string, error) {
-	blockTimeout := w.opts.DrainDelay
+	if node := w.pinnableClient(ctx); node != nil {
+		if id, handled, err := w.waitPinned(ctx, node); handled {
+			return id, err
+		}
+	}
+	return w.waitSliced(ctx)
+}
+
+// blockTimeout returns how long the idle wait lasts: until the next delayed
+// job is due when one is known (delayed is true), else DrainDelay, and never
+// longer than maxBlockTimeout.
+func (w *Worker[D, R]) blockTimeout() (wait time.Duration, delayed bool) {
+	wait = w.opts.DrainDelay
 	if blockUntil := w.blockUntil.Load(); blockUntil > 0 {
-		blockTimeout = time.Until(time.UnixMilli(blockUntil))
+		wait, delayed = time.Until(time.UnixMilli(blockUntil)), true
 	}
-	// go-redis only supports whole-second BLMOVE timeouts (and logs when
-	// truncating), so clamp to [1s, 10s].
-	if blockTimeout < time.Second {
-		blockTimeout = time.Second
+	if wait > maxBlockTimeout {
+		wait = maxBlockTimeout
 	}
-	if blockTimeout > 10*time.Second {
-		blockTimeout = 10 * time.Second
+	return wait, delayed
+}
+
+// pinnableClient returns the client waitPinned can run on: the worker's own
+// or, in a cluster, the master that serves the queue's slot. It returns nil
+// when this wait has to use waitSliced.
+//
+// A pinned read holds its connection for the whole wait, so on a busy pool
+// the client's other users would queue behind reads that last seconds. The
+// worker therefore pins only while less than half of the pool is in use,
+// which also leaves a connection free for CLIENT UNBLOCK.
+func (w *Worker[D, R]) pinnableClient(ctx context.Context) *redis.Client {
+	if w.pinnedRead.Load() == pinnedReadOff {
+		return nil
+	}
+	var node *redis.Client
+	switch c := w.redisClient.(type) {
+	case *redis.Client:
+		node = c
+	case *redis.ClusterClient:
+		master, err := c.MasterForKey(ctx, w.keyPrefix+"wait")
+		if err != nil {
+			// waitSliced goes through the cluster client, which reports this.
+			return nil
+		}
+		node = master
+	default:
+		// A Ring, a single Conn or a wrapper has no pool to pin from.
+		w.pinnedRead.Store(pinnedReadOff)
+		return nil
 	}
 
-	waitCtx, cancel := context.WithCancel(ctx)
+	opt := node.Options()
+	limit := opt.PoolSize
+	if opt.MaxActiveConns > 0 && opt.MaxActiveConns < limit {
+		limit = opt.MaxActiveConns
+	}
+	if limit < 2 {
+		w.pinnedRead.Store(pinnedReadOff)
+		return nil
+	}
+	stats := node.PoolStats()
+	if inUse := int(stats.TotalConns) - int(stats.IdleConns); inUse >= limit/2 {
+		return nil
+	}
+	return node
+}
+
+// waitPinned is the idle wait as a single BLMOVE that can be ended at any
+// moment. It pins one pool connection for the wait, which is how it knows
+// the ID of the connection the read blocks on. When the exact timeout is up,
+// or the worker pauses or closes, a watchdog sends CLIENT UNBLOCK on another
+// connection and BLMOVE returns as if it had timed out. BLMOVE's own timeout
+// is the wait rounded up to whole seconds, so the read ends even if no
+// unblock arrives.
+//
+// handled is false when the read could not be done this way and the caller
+// should use waitSliced.
+func (w *Worker[D, R]) waitPinned(ctx context.Context, node *redis.Client) (id string, handled bool, err error) {
+	wait, delayed := w.blockTimeout()
+	if wait < minBlockTimeout {
+		if delayed {
+			// Too close to be worth a read: the caller's moveToActive
+			// promotes the job and takes anything new in the wait list.
+			_ = sleepContext(ctx, wait)
+			return "", true, nil
+		}
+		wait = minBlockTimeout
+	}
+
+	conn := node.Conn()
+	defer func() { _ = conn.Close() }()
+
+	clientID, err := conn.ClientID(ctx).Result()
+	if err == nil && w.pinnedRead.Load() == pinnedReadUntried {
+		// Unblocking a connection that is not blocked does nothing, so this
+		// only shows whether the server has the command.
+		if err = conn.ClientUnblock(ctx, clientID).Err(); err == nil {
+			w.pinnedRead.Store(pinnedReadOn)
+		}
+	}
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return "", true, nil
+		}
+		if isUnsupported(err) {
+			w.pinnedRead.Store(pinnedReadOff)
+		}
+		// waitSliced needs neither command, and it reports a server that
+		// cannot be reached.
+		return "", false, nil
+	}
+
+	// stop is done when the read has to end before its own timeout.
+	stop, cancel := context.WithCancel(ctx)
 	defer cancel()
+	timeout := wait.Truncate(time.Second)
+	if timeout < wait {
+		timeout += time.Second
+		defer time.AfterFunc(wait, cancel).Stop()
+	}
+
 	w.waitCancelMu.Lock()
 	w.waitCancel = cancel
 	w.waitCancelMu.Unlock()
@@ -666,16 +852,67 @@ func (w *Worker[D, R]) waitForJob(ctx context.Context) (string, error) {
 		w.waitCancel = nil
 		w.waitCancelMu.Unlock()
 	}()
-
-	result, err := w.redisClient.BLMove(waitCtx, w.keyPrefix+"wait", w.keyPrefix+"active", "RIGHT", "LEFT", blockTimeout).Result()
-	if err != nil {
-		// Block timeout (redis.Nil) and an aborted wait are not errors.
-		if errors.Is(err, redis.Nil) || errors.Is(err, context.Canceled) {
-			return "", nil
-		}
-		return "", err
+	// Pause and Close set their flag before they call abortWait, so checking
+	// the flags after registering cancel cannot miss either of them.
+	if w.paused.Load() || w.closing.Load() {
+		return "", true, nil
 	}
-	return result, nil
+
+	// readBack is done once the read has returned. The watchdog has to be
+	// gone before the connection goes back to the pool, or an unblock still
+	// on its way could end the next blocking command sent on it.
+	readBack, markReadBack := context.WithCancel(context.Background())
+	watchdog := make(chan struct{})
+	go func() {
+		defer close(watchdog)
+		select {
+		case <-readBack.Done():
+		case <-stop.Done():
+			w.unblock(readBack, node, clientID)
+		}
+	}()
+
+	id, err = conn.BLMove(ctx, w.keyPrefix+"wait", w.keyPrefix+"active", "RIGHT", "LEFT", timeout).Result()
+	markReadBack()
+	<-watchdog
+
+	switch {
+	case err == nil:
+		if w.paused.Load() || w.closing.Load() {
+			// The ID arrived in the same instant as Pause/Close. This worker
+			// must not take it, so put it back.
+			w.returnToWait(id)
+			return "", true, nil
+		}
+		return id, true, nil
+	case errors.Is(err, redis.Nil), errors.Is(err, context.Canceled):
+		return "", true, nil
+	case isReplyError(err):
+		// For example MOVED, once the slot has changed hands. The routed
+		// client follows redirects and reports anything else.
+		return "", false, nil
+	default:
+		return "", true, err
+	}
+}
+
+// unblock ends the blocking read on connection clientID. It retries until
+// ctx is done, which is when the read has returned, because an attempt that
+// reaches the server before the read has started blocking does nothing.
+func (w *Worker[D, R]) unblock(ctx context.Context, node *redis.Client, clientID int64) {
+	for pause := time.Millisecond; ; pause *= 2 {
+		if err := node.ClientUnblock(ctx, clientID).Err(); isUnsupported(err) {
+			// The read ends on its own timeout this once.
+			w.pinnedRead.Store(pinnedReadOff)
+			return
+		}
+		if pause > unblockRetryMax {
+			pause = unblockRetryMax
+		}
+		if sleepContext(ctx, pause) != nil {
+			return
+		}
+	}
 }
 
 // abortWait cancels an in-flight blocking read, if any.
@@ -685,6 +922,86 @@ func (w *Worker[D, R]) abortWait() {
 		w.waitCancel()
 	}
 	w.waitCancelMu.Unlock()
+}
+
+// isReplyError reports whether err is an error reply from the server, as
+// opposed to a failure to reach it.
+func isReplyError(err error) bool {
+	var reply redis.Error
+	return errors.As(err, &reply) && !errors.Is(err, redis.Nil)
+}
+
+// isUnsupported reports whether the server refused a command for good: it
+// does not know the command (ERR) or the ACL forbids it (NOPERM). Conditions
+// that pass, such as LOADING and BUSY, have prefixes of their own.
+func isUnsupported(err error) bool {
+	var reply redis.Error
+	if !errors.As(err, &reply) {
+		return false
+	}
+	msg := reply.Error()
+	return strings.HasPrefix(msg, "ERR ") || strings.HasPrefix(msg, "NOPERM ")
+}
+
+// waitSliced is the idle wait when no connection can be pinned. The wait is
+// a series of one-second reads with Pause/Close checked in between, and an
+// ID that arrives after either is handed back to the queue. The last
+// sub-second before a delayed job is due is slept in short steps instead;
+// the caller's moveToActive after each step also picks up a job that
+// reached the wait list meanwhile.
+func (w *Worker[D, R]) waitSliced(ctx context.Context) (string, error) {
+	wait, delayed := w.blockTimeout()
+	var reads int
+	if delayed {
+		if wait < blockingReadSlice {
+			if wait > delayedPollInterval {
+				wait = delayedPollInterval
+			}
+			_ = sleepContext(ctx, wait)
+			return "", nil
+		}
+		// Whole seconds only; the next call handles the remainder.
+		reads = int(wait / blockingReadSlice)
+	} else {
+		// Rounded up, so a sub-second DrainDelay blocks for a second instead
+		// of polling.
+		reads = int((wait + blockingReadSlice - 1) / blockingReadSlice)
+	}
+
+	for i := 0; i < reads; i++ {
+		if w.paused.Load() || w.closing.Load() {
+			return "", nil
+		}
+		id, err := w.redisClient.BLMove(ctx, w.keyPrefix+"wait", w.keyPrefix+"active", "RIGHT", "LEFT", blockingReadSlice).Result()
+		switch {
+		case err == nil:
+			if w.paused.Load() || w.closing.Load() {
+				// Pause/Close landed while the read was in flight. This
+				// worker must not take the ID, so put it back.
+				w.returnToWait(id)
+				return "", nil
+			}
+			return id, nil
+		case errors.Is(err, redis.Nil):
+			// This read timed out; block again.
+		case errors.Is(err, context.Canceled):
+			return "", nil
+		default:
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+// returnToWait hands an ID the blocking read moved to active back to the
+// queue, for when this worker will not process it. If that fails, the ID
+// stays in active without a lock and stalled-job recovery picks it up.
+func (w *Worker[D, R]) returnToWait(id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), returnToWaitTimeout)
+	defer cancel()
+	if err := lua.ReturnToWait(ctx, w.redisClient, w.keyPrefix, id); err != nil {
+		w.emit("error", err)
+	}
 }
 
 // sleepContext sleeps for the specified duration or until context is cancelled.
@@ -721,14 +1038,6 @@ func (w *Worker[D, R]) nextJobFromJobData(
 	delayUntil int64,
 	token string,
 ) (*rawJob, error) {
-	if jobData == nil {
-		if !w.drained.Load() {
-			w.emit("drained")
-			w.drained.Store(true)
-			w.blockUntil.Store(0)
-		}
-	}
-
 	// The Lua returns limitUntil as a relative PTTL; store an absolute
 	// deadline so delay() sleeps for the actual window.
 	if limitUntil > 0 {
@@ -736,11 +1045,16 @@ func (w *Worker[D, R]) nextJobFromJobData(
 	} else {
 		w.limitUntil.Store(0)
 	}
-	if delayUntil > 0 {
-		w.blockUntil.Store(clampMin(delayUntil, 0))
-	}
 
 	if jobData == nil {
+		// Concurrent fetchers can all see the queue run dry; emit once.
+		if w.drained.CompareAndSwap(false, true) {
+			w.emit("drained")
+		}
+		// Every empty reply names the next delayed job, or 0. Storing it
+		// each time keeps a job that was removed or run elsewhere from
+		// leaving a stale deadline that cuts every later wait short.
+		w.blockUntil.Store(clampMin(delayUntil, 0))
 		return nil, nil
 	}
 
@@ -1022,16 +1336,26 @@ func (w *Worker[D, R]) Pause() {
 	w.emit("paused")
 }
 
+// blockingReadIdle reports whether no blocking wait-list read is outstanding.
+func (w *Worker[D, R]) blockingReadIdle() bool {
+	if !w.blockingFetch.TryLock() {
+		return false
+	}
+	w.blockingFetch.Unlock()
+	return true
+}
+
 // PauseAndWait pauses the worker and blocks until all jobs in progress have
-// finished or ctx is done, like upstream worker.pause(). It returns ctx.Err()
-// when the wait is cut short.
+// finished and the idle blocking read, if any, has ended, or ctx is done,
+// like upstream worker.pause(). It returns ctx.Err() when the wait is cut
+// short.
 func (w *Worker[D, R]) PauseAndWait(ctx context.Context) error {
 	w.Pause()
 	for {
 		w.jobsInProgress.Lock()
 		n := len(w.jobsInProgress.jobs)
 		w.jobsInProgress.Unlock()
-		if n == 0 || w.closing.Load() {
+		if (n == 0 && w.blockingReadIdle()) || w.closing.Load() {
 			return nil
 		}
 		select {
@@ -1117,7 +1441,8 @@ func (w *Worker[D, R]) Close() error {
 // waits for the jobs in progress to finish before cancelling the worker's
 // run context, bounded by ctx. When ctx is done first, the remaining jobs
 // are abandoned and the returned error wraps ErrShutdownTimeout and
-// ctx.Err(). Shutdown is idempotent.
+// ctx.Err(). An idle worker that has to wait in one-second reads (see
+// Lifecycle in the README) needs up to a second. Shutdown is idempotent.
 func (w *Worker[D, R]) Shutdown(ctx context.Context) error {
 	if !w.closing.CompareAndSwap(false, true) {
 		return nil
