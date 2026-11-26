@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -169,6 +170,69 @@ func TestGoProducerNodeWorker(t *testing.T) {
 	}
 	if message.Direction != "go-to-node" || message.State != "completed" {
 		t.Fatalf("unexpected Node worker result: %+v", message)
+	}
+}
+
+// An idle Go worker ends its blocking read the moment it is paused or shut
+// down. In a cluster it has to find the node that holds the queue to do
+// that, so this runs against both topologies. A read it could not end would
+// last most of a second each time.
+func TestIdleGoWorkerStopsAtOnce(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), interopDeadline)
+	defer cancel()
+
+	client := newRedisClient(t, ctx)
+	defer closeRedis(t, client)
+
+	worker, err := gobullmq.NewWorker[payload, result](newQueueName(), client, func(ctx context.Context, job *gobullmq.Job[payload]) (result, error) {
+		return result{}, nil
+	}, nil)
+	if err != nil {
+		t.Fatalf("create Go worker: %v", err)
+	}
+	drained := make(chan struct{}, 1)
+	worker.OnDrained(func() {
+		select {
+		case drained <- struct{}{}:
+		default:
+		}
+	})
+	var workerErrors atomic.Int64
+	worker.OnError(func(err error) {
+		workerErrors.Add(1)
+		t.Logf("Go worker error: %v", err)
+	})
+	if err := worker.Run(ctx); err != nil {
+		t.Fatalf("run Go worker: %v", err)
+	}
+	defer shutdownWorker(t, worker)
+
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		t.Fatal("Go worker never drained")
+	}
+	for round := 1; round <= 8; round++ {
+		time.Sleep(100 * time.Millisecond) // let it settle into the read
+		start := time.Now()
+		if err := worker.PauseAndWait(ctx); err != nil {
+			t.Fatalf("round %d: PauseAndWait: %v", round, err)
+		}
+		if took := time.Since(start); took > 400*time.Millisecond {
+			t.Fatalf("round %d: pausing an idle worker took %s", round, took)
+		}
+		worker.Resume()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	shutdownCtx, cancelShutdown := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancelShutdown()
+	if err := worker.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("shutting down an idle worker: %v", err)
+	}
+	if n := workerErrors.Load(); n != 0 {
+		t.Fatalf("Go worker reported %d error(s)", n)
 	}
 }
 
